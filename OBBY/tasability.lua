@@ -1,5 +1,3 @@
--- PC Version only!
-
 -- Config
 local FPS = 120 -- Client FPS cap. This can be higher than the TAS recording/playback FPS.
 local TASRecordingFPS = 60 -- TAS samples recorded per second. Client FPS can be higher. Playback uses this saved FPS.
@@ -10,6 +8,8 @@ local ReplayStartTime = 1 -- Number of seconds to wait before starting to read t
 local FrameBacktrackCount = 1000 -- Number of frames to backtrack when frozen to see which keys are currently pressed. Increase as much as your computer can handle
 local MinimumJSONFPS = 1/60 -- Lowest you want your FPS to go while encoding/decoding (higher = faster encoding/decoding, lower = better fps) 1/30: 30 fps, 1/60: 60 fps\
 local BypassAntiExploit = false -- If this is true games with anti cheat (like beans) will not kick you, but there is a chance animations will be broken
+
+
 
 -- Inputs that will not be recorded
 local InputBlacklist = {
@@ -207,6 +207,30 @@ local GUIParent = Player:WaitForChild("PlayerGui")
 local json
 do -- Overwriting JSON
 	json = (function()
+																			--
+																			-- json.lua
+																			--
+																			-- Copyright (c) 2020 rxi
+																			--
+																			-- Permission is hereby granted, free of charge, to any person obtaining a copy of
+																			-- this software and associated documentation files (the "Software"), to deal in
+																			-- the Software without restriction, including without limitation the rights to
+																			-- use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+																			-- of the Software, and to permit persons to whom the Software is furnished to do
+																			-- so, subject to the following conditions:
+																			--
+																			-- The above copyright notice and this permission notice shall be included in all
+																			-- copies or substantial portions of the Software.
+																			--
+																			-- THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+																			-- IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+																			-- FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+																			-- AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+																			-- LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+																			-- OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+																			-- SOFTWARE.
+																			--
+
 																			local json = { _version = "0.1.2" }
 																			
 																			local t = tick()
@@ -942,7 +966,7 @@ local function createStatsHud()
         gravLabel.Text  = string.format("Gravity: <font color='#c8c8ff'>%.2f</font>", workspace.Gravity)
  
         local totalFrames = #ReplayTable
-        local cf = Frozen and RoundNumber(FreezeFrame, 0) or (Reading and ReplayTableIndex or 0)
+        local cf = Frozen and math.floor((FreezeFrame or 0) + 0.5) or (Reading and ReplayTableIndex or 0)
         frameLabel.Text = string.format("Frame: <font color='#64afff'>%d / %d</font>", cf, totalFrames)
         timeLabel.Text  = string.format("Time:  <font color='#64afff'>%.2fs</font>", cf / math.max(ReplaySourceFPS or TASRecordingFPS or 1, 1))
  
@@ -3718,6 +3742,10 @@ do
             local part = objectRegistry[id]
             if part and part.Parent then
                 part.CFrame = part.CFrame:Lerp(FastTableToCFrame(target), alpha)
+                if not part.Anchored then
+                    part.AssemblyLinearVelocity = Vector3.zero
+                    part.AssemblyAngularVelocity = Vector3.zero
+                end
             end
         end
     end
@@ -4487,6 +4515,8 @@ end
             PlaybackAccumulator = 0
             PlaybackSourcePosition = 1
             CO.RebuildFromAttributes()
+            CO._lastCoTime = nil
+            CO._lerpTargets = {}
             CO.AnchorAll() 
             BlockInputs()
             Reading = true
@@ -4517,6 +4547,8 @@ end
             -- Stop the playback source without resetting the current frame first.
             -- This lets Abort preserve the exact state the user was looking at.
 		    CO.RestoreAnchors()
+            CO._lastCoTime = nil
+            CO._lerpTargets = {}
 		    CO.Stop()
 			UnblockInputs() -- Enable scrolling and clicks
 			Character.Head.CanCollide = true -- Fix character collisions
