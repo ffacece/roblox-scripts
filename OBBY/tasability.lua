@@ -100,21 +100,23 @@ local Checkpoints = {}
 local RenderSteppedConnections = {}
 local SteppedConnections = {}
 local FolderPath = "Tasability\\"..tostring(PlaceId)
-local ReplayPath = FolderPath.."\\Replay.tas"
+local ReplayPath = FolderPath.."\\Replay.json"
 if isfolder(FolderPath) then
     local legacyReplayPath = nil
+    local jsonReplayPath = nil
     for _, filePath in ipairs(listfiles(FolderPath)) do
         if type(filePath) == "string" then
             local lowerPath = filePath:lower()
-            if lowerPath:sub(-4) == ".tas" then
-                ReplayPath = filePath
-                break
-            elseif lowerPath:sub(-5) == ".json" and not legacyReplayPath then
+            if lowerPath:sub(-5) == ".json" and not jsonReplayPath then
+                jsonReplayPath = filePath
+            elseif lowerPath:sub(-4) == ".tas" and not legacyReplayPath then
                 legacyReplayPath = filePath
             end
         end
     end
-    if not isfile(ReplayPath) and legacyReplayPath then
+    if jsonReplayPath then
+        ReplayPath = jsonReplayPath
+    elseif legacyReplayPath then
         ReplayPath = legacyReplayPath
     end
 end
@@ -159,6 +161,14 @@ local ReplayCharacterCollisionStates = nil -- Original CanCollide state of chara
 local ReplayAnimateScript = nil
 local ReplayAnimateScriptDisabled = nil
 local FrozenCameraFollowsReplay = false -- Legacy compatibility flag; Frozen camera follows the selected replay frame.
+local FrozenMouseBehavior = nil
+local PendingRecordingStart = false
+local PendingReadingStart = false
+local COInitializationQueued = false
+local FrozenCameraType = nil
+local FrozenCameraBindName = "TasabilityFrozenCamera"
+local FrozenCameraCFrame = nil
+local FrozenHeldCO = false
 
 -- Converting inputs
 -- To add to this table, use https://docs.microsoft.com/en-us/windows/win32/inputdev/virtual-key-codes
@@ -2976,12 +2986,12 @@ addButton(fileSec, "Create File", function()
     local popup = makePopup("Create file")
     popup:Textbox({Text = "File name", Placeholder = "name...", Callback = function(_, name)
         if #name > 0 then
-            writefile(FolderPath.."./"..name..".tas", "")
+            writefile(FolderPath.."./"..name..".json", "")
             ReplayTable = {}
             ReplaySaveState.Version = ReplaySaveState.Version + 1
             ReplaySaveState.Encoded = nil
             ReplaySaveState.EncodedVersion = -1
-            ReplayPath = FolderPath.."./"..name..".tas"
+            ReplayPath = FolderPath.."./"..name..".json"
         end
     end})
     popup:Button({Text = "Done", Callback = function() popup:ClosePopup() end})
@@ -3000,7 +3010,7 @@ addButton(fileSec, "Load File", function()
                 if #fc > #ReplayFileBeginning then
                     ReplayTable = ReplayDecode(fc)
                     ReplaySaveState.Version = ReplaySaveState.Version + 1
-                    ReplaySaveState.Encoded = (type(fc) == "string" and fc:sub(1, 4) == "TAS5") and fc or nil
+                    ReplaySaveState.Encoded = (type(fc) == "string" and fc ~= "") and fc or nil
                     ReplaySaveState.EncodedVersion = ReplaySaveState.Encoded and ReplaySaveState.Version or -1
                     ReplayNeedsReload = false; LastLoadedPath = path
                     ConsoleMessage("Decoded and cached replay")
@@ -4128,6 +4138,7 @@ local CO = {}
 do
     local CO_EPSILON        = 0.001
     local CO_ATTRIBUTE_NAME = "TAS_ObjectId"
+    local CO_SCAN_CHUNK     = 350 -- Yield often enough to keep Record/startup responsive.
 
     local objectRegistry = {}
     local idByObject     = {}
@@ -4137,6 +4148,14 @@ do
     local watchConn      = nil
     local ropePartSet    = {}
     local originalAnchored = {}
+
+    -- Anchored BaseParts are not added to the main registry immediately,
+    -- because maps can contain thousands of static parts. We still watch them
+    -- so a client object that becomes physical after the player approaches it
+    -- can be registered at that moment.
+    local anchoredCandidates = {}
+    local anchoredCandidateConnections = {}
+    local forceCaptureIds = {}
 
     local function isBlacklisted(part)
         if Character and part:IsDescendantOf(Character) then return true end
@@ -4157,13 +4176,33 @@ do
         end
     end
 
-    local function registerPart(part)
-        if idByObject[part] then return end
+    local function clearAnchoredCandidate(part)
+        anchoredCandidates[part] = nil
+        local conn = anchoredCandidateConnections[part]
+        if conn then
+            conn:Disconnect()
+            anchoredCandidateConnections[part] = nil
+        end
+    end
+
+    local function registerPart(part, forceCapture)
+        if idByObject[part] then
+            local id = idByObject[part]
+            if forceCapture then
+                forceCaptureIds[id] = true
+            end
+            clearAnchoredCandidate(part)
+            return
+        end
         if not part:IsA("BasePart") then return end
         if isBlacklisted(part) then return end
-        if part.Anchored and not ropePartSet[part] then return end
 
+        -- Existing TAS_ObjectId is authoritative. If a part already has an ID,
+        -- allow it to be restored even while it is still anchored.
         local existingId = part:GetAttribute(CO_ATTRIBUTE_NAME)
+        local eligible = (not part.Anchored) or ropePartSet[part] or existingId ~= nil
+        if not eligible then return end
+
         local id
         if existingId and not objectRegistry[existingId] then
             id = existingId
@@ -4176,17 +4215,53 @@ do
         objectRegistry[id] = part
         idByObject[part]   = id
         lastCFrames[id]    = part.CFrame
+        forceCaptureIds[id] = forceCapture == true
+        clearAnchoredCandidate(part)
+    end
+
+    local function watchAnchoredPart(part)
+        if not part or not part:IsA("BasePart") then return end
+        if idByObject[part] or isBlacklisted(part) then return end
+        if not part.Anchored or ropePartSet[part] then
+            registerPart(part, true)
+            return
+        end
+        if anchoredCandidateConnections[part] then return end
+
+        anchoredCandidates[part] = part.CFrame
+        local conn = part:GetPropertyChangedSignal("Anchored"):Connect(function()
+            if not part.Parent or isBlacklisted(part) then
+                clearAnchoredCandidate(part)
+                return
+            end
+            if not part.Anchored or ropePartSet[part] then
+                registerPart(part, true)
+            end
+        end)
+        anchoredCandidateConnections[part] = conn
     end
 
     local function scanWorkspace()
         rebuildRopePartSet()
-        for _, desc in ipairs(workspace:GetDescendants()) do
-            if desc:IsA("BasePart") and (not desc.Anchored or ropePartSet[desc]) and not isBlacklisted(desc) then
-                registerPart(desc)
+        local descendants = workspace:GetDescendants()
+        local processed = 0
+        for i = 1, #descendants do
+            local desc = descendants[i]
+            if desc:IsA("BasePart") and not isBlacklisted(desc) then
+                if not desc.Anchored or ropePartSet[desc] or desc:GetAttribute(CO_ATTRIBUTE_NAME) ~= nil then
+                    registerPart(desc, false)
+                else
+                    watchAnchoredPart(desc)
+                end
+            end
+            processed = processed + 1
+            if processed >= CO_SCAN_CHUNK then
+                processed = 0
+                RunService.Heartbeat:Wait()
             end
         end
         scanComplete = true
-        ConsoleMessage("[CO] Scanned " .. tostring(nextId - 1) .. " moving parts")
+        ConsoleMessage("[CO] Scanned " .. tostring(nextId - 1) .. " registered parts; watching anchored candidates")
     end
 
     local function startWatching()
@@ -4194,24 +4269,61 @@ do
         watchConn = workspace.DescendantAdded:Connect(function(desc)
             if desc:IsA("RopeConstraint") then
                 task.defer(function() rebuildRopePartSet() end)
-            elseif desc:IsA("BasePart") and (not desc.Anchored or ropePartSet[desc]) and not isBlacklisted(desc) then
-                registerPart(desc)
+            elseif desc:IsA("BasePart") and not isBlacklisted(desc) then
+                if not desc.Anchored or ropePartSet[desc] or desc:GetAttribute(CO_ATTRIBUTE_NAME) ~= nil then
+                    registerPart(desc, true)
+                else
+                    watchAnchoredPart(desc)
+                end
             end
         end)
     end
 
     function CO.Init()
+        CO._initializing = true
         objectRegistry = {}
         idByObject     = {}
         lastCFrames    = {}
         originalAnchored = {}
+        anchoredCandidates = {}
+        for part, conn in pairs(anchoredCandidateConnections) do
+            if conn then conn:Disconnect() end
+            anchoredCandidateConnections[part] = nil
+        end
+        forceCaptureIds = {}
         nextId         = 1
         scanComplete   = false
         scanWorkspace()
         startWatching()
         RunService.Heartbeat:Wait()
         ConsoleMessage("[CO] Init done, recording world objects")
+        CO._initialized = true
+        CO._initializing = false
+        if CO._recordingRequested then
+            -- The registry was rebuilt while recording was already running.
+            -- Capture a complete CO state on the next sample so newly discovered
+            -- objects are not missing from the replay prefix.
+            CO._forceFullFrame = true
+            lastCFrames = {}
+        end
     end
+
+    CO._initializing = false
+    local function QueueCOInitialization()
+        if CO._initialized or CO._initializing or COInitializationQueued then
+            return
+        end
+        COInitializationQueued = true
+        task.spawn(function()
+            local ok, err = pcall(function() CO.Init() end)
+            COInitializationQueued = false
+            if not ok then
+                CO._initializing = false
+                ConsoleMessage("[CO] Init failed: "..tostring(err))
+            end
+        end)
+    end
+    CO.QueueInitialization = QueueCOInitialization
 
     function CO.RecordFrame()
         if not scanComplete then return {} end
@@ -4221,10 +4333,8 @@ do
             if part and part.Parent then
                 local cf   = part.CFrame
                 local prev = lastCFrames[id]
-                local moved = false
-                if forceAll then
-                    moved = true
-                elseif prev then
+                local moved = forceAll or forceCaptureIds[id] == true
+                if not moved and prev then
                     local rel = prev:ToObjectSpace(cf)
                     local pos = rel.Position
                     if  math.abs(pos.X)                > CO_EPSILON
@@ -4234,13 +4344,16 @@ do
                     then
                         moved = true
                     end
-                else
+                elseif not moved then
                     moved = true
                 end
                 if moved then
                     delta[tostring(id)] = RoundTable({cf:GetComponents()}, RoundDigits)
                     lastCFrames[id]     = cf
+                    forceCaptureIds[id] = nil
                 end
+            else
+                forceCaptureIds[id] = nil
             end
         end
         CO._forceFullFrame = false
@@ -4248,9 +4361,11 @@ do
     end
 
     
-    local coRate    = 15       
+    local coRate    = 15
     local lerpTargets = {}
     local lastCoTime  = nil
+    local playbackLerpAlpha = 1
+    local playbackNextDelta = nil
 
     local coDataWarned = false
     function CO.ApplyFrame(delta, forcedAlpha)
@@ -4263,9 +4378,6 @@ do
         end
         coDataWarned = false
 
-        -- Keep the last target for every tracked object. A frame may contain
-        -- only changed objects, so unchanged objects must remain at their last
-        -- recorded state instead of being left to physics.
         for idStr, components in pairs(delta) do
             lerpTargets[idStr] = components
         end
@@ -4278,19 +4390,59 @@ do
             alpha = 1 - math.exp(-coRate * dt)
         end
 
-        -- Playback passes alpha = 0 for strict frame-by-frame TAS playback.
-        -- This applies the recorded CFrame exactly and avoids micro-rotation
-        -- caused by smoothing between replay samples.
         for idStr, target in pairs(lerpTargets) do
-            local id   = tonumber(idStr)
+            local id = tonumber(idStr)
             local part = objectRegistry[id]
             if part and part.Parent then
                 local targetCFrame = FastTableToCFrame(target)
                 if alpha <= 0 then
                     part.CFrame = targetCFrame
+                elseif alpha >= 1 then
+                    part.CFrame = targetCFrame
                 else
                     part.CFrame = part.CFrame:Lerp(targetCFrame, alpha)
                 end
+            end
+        end
+    end
+
+    function CO.ApplyInterpolatedFrame(currentDelta, nextDelta, alpha)
+        if currentDelta == nil then
+            CO.WarnNoCOData()
+            return
+        end
+        coDataWarned = false
+
+        -- Frame[13] is delta data: only objects that changed in the current
+        -- sample are present. Keep the last known target for every object.
+        for idStr, components in pairs(currentDelta) do
+            lerpTargets[idStr] = components
+        end
+
+        alpha = math.clamp(tonumber(alpha) or 0, 0, 1)
+        for idStr, currentTarget in pairs(lerpTargets) do
+            local id = tonumber(idStr)
+            local part = objectRegistry[id]
+            if part and part.Parent then
+                local nextTarget = nil
+                if nextDelta then
+                    nextTarget = nextDelta[idStr]
+                    if nextTarget == nil and id ~= nil then
+                        nextTarget = nextDelta[tostring(id)]
+                    end
+                end
+
+                local fromCF = FastTableToCFrame(currentTarget)
+                local toCF = nextTarget and FastTableToCFrame(nextTarget) or fromCF
+                if alpha <= 0 or fromCF == toCF then
+                    part.CFrame = fromCF
+                elseif alpha >= 1 then
+                    part.CFrame = toCF
+                else
+                    part.CFrame = fromCF:Lerp(toCF, alpha)
+                end
+                part.AssemblyLinearVelocity = Vector3.zero
+                part.AssemblyAngularVelocity = Vector3.zero
             end
         end
     end
@@ -4326,16 +4478,29 @@ do
         idByObject     = {}
         lastCFrames    = {}
         originalAnchored = {}
+        anchoredCandidates = {}
+        for part, conn in pairs(anchoredCandidateConnections) do
+            if conn then conn:Disconnect() end
+            anchoredCandidateConnections[part] = nil
+        end
+        forceCaptureIds = {}
         rebuildRopePartSet()
         local highest  = 0
         for _, desc in ipairs(workspace:GetDescendants()) do
-            if desc:IsA("BasePart") then
+            if desc:IsA("BasePart") and not isBlacklisted(desc) then
                 local id = desc:GetAttribute(CO_ATTRIBUTE_NAME)
                 if id then
                     objectRegistry[id] = desc
                     idByObject[desc]   = id
                     lastCFrames[id]    = desc.CFrame
+                    forceCaptureIds[id] = true
                     if id >= highest then highest = id + 1 end
+                elseif not desc.Anchored or ropePartSet[desc] then
+                    registerPart(desc, true)
+                    local newId = idByObject[desc]
+                    if newId and newId >= highest then highest = newId + 1 end
+                else
+                    watchAnchoredPart(desc)
                 end
             end
         end
@@ -4346,15 +4511,57 @@ do
     end
 
 	function CO.GetFullStateAtFrame(frameIndex, replayTable)
+        frameIndex = math.max(0, math.floor(tonumber(frameIndex) or 0))
+        if frameIndex <= 0 or type(replayTable) ~= "table" then return {} end
+
+        local cache = CO._FullStateCache
+        if type(cache) ~= "table" then
+            cache = {frame = 0, state = {}, checkpoints = {}}
+            CO._FullStateCache = cache
+        end
+        cache.checkpoints = cache.checkpoints or {}
+
+        if cache.frame == frameIndex then
+            return cache.state
+        end
+
+        local checkpointStep = 300
+        local startFrame = 1
         local state = {}
-        for i = 1, frameIndex do
+
+        if frameIndex >= cache.frame and cache.frame > 0 then
+            startFrame = cache.frame + 1
+            state = cache.state
+        else
+            local bestFrame = 0
+            for cpFrame, cpState in pairs(cache.checkpoints) do
+                if cpFrame <= frameIndex and cpFrame > bestFrame then
+                    bestFrame = cpFrame
+                    state = {}
+                    for id, components in pairs(cpState) do state[id] = components end
+                end
+            end
+            if bestFrame > 0 then
+                startFrame = bestFrame + 1
+            end
+        end
+
+        for i = startFrame, frameIndex do
             local frame = replayTable[i]
             if type(frame) == "table" and frame[13] then
                 for idStr, components in pairs(frame[13]) do
                     state[idStr] = components
                 end
             end
+            if i % checkpointStep == 0 then
+                local cp = {}
+                for id, components in pairs(state) do cp[id] = components end
+                cache.checkpoints[i] = cp
+            end
         end
+
+        cache.frame = frameIndex
+        cache.state = state
         return state
     end
 
@@ -4370,7 +4577,33 @@ do
         end
     end
 
+    function CO.HoldCurrentState()
+        for id, part in pairs(objectRegistry) do
+            if part and part.Parent then
+                if originalAnchored[id] == nil then originalAnchored[id] = part.Anchored end
+                part.AssemblyLinearVelocity = Vector3.zero
+                part.AssemblyAngularVelocity = Vector3.zero
+                part.Anchored = true
+            end
+        end
+        FrozenHeldCO = true
+    end
+
+    function CO.ReleaseHeldState()
+        if not FrozenHeldCO then return end
+        for id, part in pairs(objectRegistry) do
+            if part and part.Parent and originalAnchored[id] ~= nil then
+                part.AssemblyLinearVelocity = Vector3.zero
+                part.AssemblyAngularVelocity = Vector3.zero
+                part.Anchored = originalAnchored[id] == true
+            end
+        end
+        originalAnchored = {}
+        FrozenHeldCO = false
+    end
+
     function CO.Stop()
+        CO._recordingRequested = false
         if watchConn then
             watchConn:Disconnect()
             watchConn = nil
@@ -4378,6 +4611,12 @@ do
         lerpTargets  = {}
         lastCoTime   = nil
         originalAnchored = {}
+        for part, conn in pairs(anchoredCandidateConnections) do
+            if conn then conn:Disconnect() end
+            anchoredCandidateConnections[part] = nil
+        end
+        anchoredCandidates = {}
+        forceCaptureIds = {}
         scanComplete = false
     end
 
@@ -4385,6 +4624,7 @@ do
     -- above intentionally matches message.txt; these helpers only satisfy the
     -- newer TAS5 call sites without changing the CO state semantics.
     CO._initialized = false
+    CO._recordingRequested = false
     CO._forceFullFrame = false
     CO._coDataWarned = false
     CO._replayHasNoCO = false
@@ -4399,7 +4639,10 @@ do
     CO.Init = function(...)
         _CO_Init(...)
         CO._initialized = true
-        CO._forceFullFrame = false
+        CO._forceFullFrame = CO._recordingRequested == true
+        if CO._recordingRequested then
+            lastCFrames = {}
+        end
         CO._coDataWarned = false
         CO._replayHasNoCO = false
         CO._currentTargets = {}
@@ -4425,14 +4668,33 @@ do
         CO._FullStateCache = nil
     end
 
+    function CO.ReuseRegistryForPlayback()
+        -- Reuse the already-built registry when playback follows a recording in the same session.
+        -- This avoids rescanning the entire workspace on every Read.
+        scanComplete = true
+        for id, part in pairs(objectRegistry) do
+            if part and part.Parent then
+                lastCFrames[id] = part.CFrame
+            else
+                objectRegistry[id] = nil
+            end
+        end
+        startWatching()
+    end
+
     function CO.BeginRecording()
+        CO._recordingRequested = true
         CO._forceFullFrame = true
         -- Force a complete first client-object frame so initially stationary
-        -- RopeConstraint parts are present in the replay from frame 1.
+        -- client objects are present in the replay from frame 1.
         lastCFrames = {}
+        forceCaptureIds = {}
     end
 
     function CO.ResetTargets()
+        playbackLerpAlpha = 1
+        playbackNextDelta = nil
+        lastCoTime = nil
         CO._currentTargets = {}
         CO._activeIds = {}
         CO._activeIdSet = {}
@@ -4440,7 +4702,12 @@ do
         CO._activeNext = {}
     end
 
-    function CO.BeginPlaybackCleanup() end
+    function CO.BeginPlaybackCleanup()
+        CO._FullStateCache = nil
+        lastCoTime = nil
+        playbackLerpAlpha = 1
+        playbackNextDelta = nil
+    end
     function CO.EndPlaybackCleanup() end
 
     function CO.InvalidateStateCache()
@@ -4505,8 +4772,7 @@ do
         makefolder(FolderPath)
     end
     if not isfile(ReplayPath) then
-        local emptyRaw = "TAS4" .. string.char(1, 0, 0, 0, 0, 0)
-        local emptyReplay = "TAS5" .. string.char(1, 0) .. string.char(#emptyRaw) .. emptyRaw
+        local emptyReplay = '{"Format":"TASABILITY_JSON2","Version":2,"FPS":'..tostring(math.max(1, tonumber(TASRecordingFPS) or 1))..',"Replay":[]}'
         writefile(ReplayPath,emptyReplay)
         return emptyReplay
     end
@@ -5050,26 +5316,224 @@ do
 	return {encode = encode, decode = decode, compress = tas5Compress}
 	end)()
 
-	ReplayEncode = function(Table)
-        -- Save-only cache: if ReplayTable has not changed since the last encode,
-        -- reuse the exact encoded bytes instead of rebuilding TAS4 + Zstd.
+
+	-- Compact JSON replay codec.
+    -- JSON3 keeps the file a real JSON document, but stores the replay payload
+    -- in the already-tested TAS4/TAS5 binary codec.  This avoids the huge
+    -- textual overhead of writing thousands of CFrame components as JSON.
+    -- Legacy JSON2 files are still decoded for compatibility.
+
+    local Base64Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    local Base64DecodeMap = {}
+    for i = 1, #Base64Alphabet do
+        Base64DecodeMap[Base64Alphabet:sub(i, i)] = i - 1
+    end
+
+    local function Base64Encode(data)
+        if type(data) ~= "string" then error("Base64Encode expected string") end
+        local out = {}
+        local oi = 0
+        local i = 1
+        local len = #data
+        while i <= len do
+            local a = string.byte(data, i) or 0
+            local b = (i + 1 <= len) and (string.byte(data, i + 1) or 0) or 0
+            local c = (i + 2 <= len) and (string.byte(data, i + 2) or 0) or 0
+            local triple = a * 65536 + b * 256 + c
+            local s1 = math.floor(triple / 262144) % 64 + 1
+            local s2 = math.floor(triple / 4096) % 64 + 1
+            local s3 = math.floor(triple / 64) % 64 + 1
+            local s4 = triple % 64 + 1
+            oi = oi + 1; out[oi] = Base64Alphabet:sub(s1, s1)
+            oi = oi + 1; out[oi] = Base64Alphabet:sub(s2, s2)
+            if i + 1 <= len then
+                oi = oi + 1; out[oi] = Base64Alphabet:sub(s3, s3)
+            else
+                oi = oi + 1; out[oi] = "="
+            end
+            if i + 2 <= len then
+                oi = oi + 1; out[oi] = Base64Alphabet:sub(s4, s4)
+            else
+                oi = oi + 1; out[oi] = "="
+            end
+            i = i + 3
+        end
+        return table.concat(out)
+    end
+
+    local function Base64Decode(data)
+        if type(data) ~= "string" then error("Base64Decode expected string") end
+        data = data:gsub("%s+", "")
+        if (#data % 4) ~= 0 then error("invalid base64 length") end
+        local out = {}
+        local oi = 0
+        local i = 1
+        while i <= #data do
+            local aChar = data:sub(i, i)
+            local bChar = data:sub(i + 1, i + 1)
+            local cChar = data:sub(i + 2, i + 2)
+            local dChar = data:sub(i + 3, i + 3)
+            local a = Base64DecodeMap[aChar]
+            local b = Base64DecodeMap[bChar]
+            if a == nil or b == nil then error("invalid base64 character") end
+            local c = (cChar == "=") and 0 or Base64DecodeMap[cChar]
+            local d = (dChar == "=") and 0 or Base64DecodeMap[dChar]
+            if c == nil or d == nil then error("invalid base64 character") end
+            local triple = a * 262144 + b * 4096 + c * 64 + d
+            oi = oi + 1; out[oi] = string.char(math.floor(triple / 65536) % 256)
+            if cChar ~= "=" then
+                oi = oi + 1; out[oi] = string.char(math.floor(triple / 256) % 256)
+            end
+            if dChar ~= "=" then
+                oi = oi + 1; out[oi] = string.char(triple % 256)
+            end
+            i = i + 4
+        end
+        return table.concat(out)
+    end
+
+    local function JSON3CompressBinary(raw)
+        -- TAS4Codec.compress returns a TAS5 payload when Zstd is available,
+        -- and a valid TAS5 raw wrapper otherwise.  Keep the exact payload.
+        return TAS4Codec.compress(raw)
+    end
+
+    local function JSON3DecompressBinary(payload)
+        -- TAS4Codec.decode already understands TAS5 and TAS4, so use its
+        -- compatibility path instead of duplicating the decompressor here.
+        return payload
+    end
+
+    local function JSONReplayEncode(Table)
+        if type(Table) ~= "table" then error("replay must be a table") end
+        local StartTick = tick()
+        local raw = TAS4Codec.encode(Table)
+        local packed = JSON3CompressBinary(raw)
+        local payload = {
+            Format = "TASABILITY_JSON3",
+            Version = 3,
+            FPS = math.max(1, tonumber(RecordingReplayFPS or ActiveReplayFPS or ReplaySourceFPS or TASRecordingFPS) or 1),
+            Compression = (packed:sub(1, 4) == "TAS5") and "TAS5" or "TAS4",
+            Binary = "base64",
+            RawBytes = #raw,
+            PackedBytes = #packed,
+            Frames = #Table,
+            Data = Base64Encode(packed),
+        }
+        local encoded = json.encode(payload)
+        ConsoleMessage("JSON3 encoded "..tostring(#Table).." frames: "..tostring(#encoded).." bytes (binary "..tostring(#packed)..") in "..RoundNumber(tick()-StartTick,2).." seconds")
+        return encoded
+    end
+
+    local function JSON2ReplayDecode(decoded)
+        if type(decoded) ~= "table" or decoded.Format ~= "TASABILITY_JSON2" or type(decoded.Replay) ~= "table" then
+            error("invalid TASABILITY JSON2 replay")
+        end
+        local replay = {}
+        local fps = tonumber(decoded.FPS) or TASRecordingFPS
+        local function unpackCO(list)
+            local result = {}
+            if type(list) ~= "table" then return result end
+            local index, lastId = 1, 0
+            while index <= #list do
+                local deltaId = tonumber(list[index]) or 0
+                index += 1
+                local id = lastId + deltaId
+                lastId = id
+                local components = {}
+                for j = 1, 12 do
+                    components[j] = list[index] or 0
+                    index += 1
+                end
+                result[tostring(id)] = components
+            end
+            return result
+        end
+        local previousFrame = nil
+        for _, item in ipairs(decoded.Replay) do
+            if item == 0 or item == 1 then
+                replay[#replay + 1] = item
+                previousFrame = nil
+            elseif type(item) == "table" and item[1] == 3 and #item == 2 then
+                local count = math.max(0, math.floor(tonumber(item[2]) or 0))
+                if not previousFrame then error("repeat frame without previous frame") end
+                for _ = 1, count do
+                    local repeatFrame = {}
+                    repeatFrame[1] = previousFrame[1]
+                    repeatFrame[2] = {}
+                    repeatFrame[3] = previousFrame[3]
+                    repeatFrame[4] = previousFrame[4]
+                    repeatFrame[5] = previousFrame[5]
+                    repeatFrame[6] = previousFrame[6]
+                    repeatFrame[7] = previousFrame[7]
+                    repeatFrame[8] = previousFrame[8]
+                    repeatFrame[9] = previousFrame[9]
+                    repeatFrame[10] = previousFrame[10]
+                    repeatFrame[11] = previousFrame[11]
+                    repeatFrame[12] = {{}, {}}
+                    repeatFrame[13] = {}
+                    replay[#replay + 1] = repeatFrame
+                end
+            elseif type(item) == "table" then
+                local frame = {}
+                for i = 1, 12 do frame[i] = item[i] end
+                frame[13] = unpackCO(item[13])
+                replay[#replay + 1] = frame
+                previousFrame = frame
+            else
+                replay[#replay + 1] = 0
+                previousFrame = nil
+            end
+        end
+        return replay, fps
+    end
+
+    local function JSONReplayDecode(String)
+        local decoded = json.decode(String)
+        if type(decoded) ~= "table" then error("invalid JSON replay root") end
+        if decoded.Format == "TASABILITY_JSON3" then
+            if decoded.Version ~= 3 then error("unsupported TASABILITY JSON3 version "..tostring(decoded.Version)) end
+            if decoded.Binary ~= "base64" or type(decoded.Data) ~= "string" then
+                error("invalid TASABILITY JSON3 binary payload")
+            end
+            local packed = Base64Decode(decoded.Data)
+            local ok, replay, replayFPS = pcall(TAS4Codec.decode, packed)
+            if not ok then error("JSON3 binary decode failed: "..tostring(replay)) end
+            return replay, tonumber(decoded.FPS) or replayFPS or TASRecordingFPS
+        end
+        if decoded.Format == "TASABILITY_JSON2" then
+            return JSON2ReplayDecode(decoded)
+        end
+        if type(decoded.Replay) == "table" then
+            local replayFPS = tonumber(decoded.FPS)
+            return decoded.Replay, replayFPS
+        end
+        error("invalid TASABILITY JSON replay format")
+    end
+
+    ReplayEncode = function(Table)
         if Table == ReplayTable and ReplaySaveState.Encoded and ReplaySaveState.EncodedVersion == ReplaySaveState.Version then
-            ConsoleMessage("TAS5 reused cached encoding: "..tostring(#ReplaySaveState.Encoded).." bytes")
+            ConsoleMessage("JSON3 replay reused cached encoding: "..tostring(#ReplaySaveState.Encoded).." bytes")
             return ReplaySaveState.Encoded
         end
-		local raw = TAS4Codec.encode(Table)
-		local encoded = TAS4Codec.compress(raw)
+        local encoded = JSONReplayEncode(Table)
         if Table == ReplayTable then
             ReplaySaveState.Encoded = encoded
             ReplaySaveState.EncodedVersion = ReplaySaveState.Version
         end
-		ConsoleMessage("TAS5 saved: "..tostring(#encoded).." bytes (raw TAS4 "..tostring(#raw)..")")
-		return encoded
-	end
+        return encoded
+    end
 
-	ReplayDecode = function(String)
-		return TAS4Codec.decode(String)
-	end
+    ReplayDecode = function(String)
+        if type(String) ~= "string" then return nil end
+        if String:sub(1,1) == "{" then
+            local ok, replay, replayFPS = pcall(JSONReplayDecode, String)
+            if ok then return replay, replayFPS end
+            ConsoleMessage("JSON replay decode failed: "..tostring(replay))
+            return nil
+        end
+        return TAS4Codec.decode(String)
+    end
 
 	RecordReplay = function()
 		ConsoleMessage("Waiting for input")
@@ -5086,12 +5550,15 @@ do
 	end
 	StartRecording = function()
 		if not Reading then
-			-- CO must be fully initialized BEFORE the first recording sample.
-			-- This matches message.txt and prevents the first client-object frames
-			-- from being silently recorded with an empty Frame[13].
-			if not CO._initialized then
-				CO.Init()
+			if CO.ReleaseHeldState then pcall(CO.ReleaseHeldState) end
+			-- Recording must begin immediately. CO initialization continues in the background
+			-- and late-registered client objects are picked up by the existing watchers.
+			-- This removes the Record hotkey wait on a full workspace scan.
+			if not CO._initialized and not CO._initializing then
+				CO.QueueInitialization()
 			end
+			CO._recordingRequested = true
+			CO.BeginRecording()
 			-- Client FPS cap and TAS recording FPS are independent.
 			-- Example: FPS=120, TASRecordingFPS=60 => client at 120 FPS,
 			-- replay samples at exactly 60 FPS.
@@ -5159,11 +5626,31 @@ do
 	end
 
 	SaveToFile = function()
-    local ReplayEncoded = ReplayEncode(ReplayTable)
-    writefile(ReplayPath,ReplayEncoded)
-    ReplayNeedsReload = false -- We just saved, so ReplayTable is already up to date
+    local targetPath = ReplayPath
+    if type(targetPath) == "string" and targetPath:lower():sub(-4) == ".tas" then
+        targetPath = targetPath:sub(1, -5) .. ".json"
+    end
+
+    local okEncode, ReplayEncoded = pcall(ReplayEncode, ReplayTable)
+    if not okEncode or type(ReplayEncoded) ~= "string" then
+        ConsoleMessage("Save failed during encoding: "..tostring(ReplayEncoded))
+        return false
+    end
+
+    local okWrite, writeErr = pcall(function()
+        if not isfolder(FolderPath) then makefolder(FolderPath) end
+        writefile(targetPath, ReplayEncoded)
+    end)
+    if not okWrite then
+        ConsoleMessage("Save failed during writefile: "..tostring(writeErr))
+        return false
+    end
+
+    ReplayPath = targetPath
+    ReplayNeedsReload = false
     LastLoadedPath = ReplayPath
-    ConsoleMessage("Saved to file (cached in memory)")
+    ConsoleMessage("Saved JSON replay: "..tostring(ReplayPath).." ("..tostring(#ReplayEncoded).." bytes)")
+    return true
 end
 	
 	SaveRecording = function()
@@ -5207,7 +5694,7 @@ end
             if decoded then
                 ReplayTable = decoded
                 ReplaySaveState.Version = ReplaySaveState.Version + 1
-                ReplaySaveState.Encoded = (type(fileContent) == "string" and fileContent:sub(1, 4) == "TAS5") and fileContent or nil
+                ReplaySaveState.Encoded = (type(fileContent) == "string" and fileContent ~= "") and fileContent or nil
                 ReplaySaveState.EncodedVersion = ReplaySaveState.Encoded and ReplaySaveState.Version or -1
                 ReplaySourceFPS = math.max(1, tonumber(replayFPS or TASRecordingFPS) or 1)
                 ActiveReplayFPS = ReplaySourceFPS
@@ -5241,7 +5728,12 @@ end
             -- TAS_ObjectId attributes. This is what message.txt uses for replay.
             -- CO.Init() scans only currently-unanchored parts and can miss objects
             -- after a previous playback.
-            CO.RebuildFromAttributes()
+            if CO.ReleaseHeldState then pcall(CO.ReleaseHeldState) end
+            if CO._initialized and CO.ReuseRegistryForPlayback then
+                CO.ReuseRegistryForPlayback()
+            else
+                CO.RebuildFromAttributes()
+            end
             CO.BeginPlaybackCleanup()
             CO.ResetTargets()
             CO._coDataWarned = false
@@ -5284,11 +5776,16 @@ end
 		PlaybackAccumulator = 0
 		if Reading then
             Reading = false
-            -- Stop the playback source without resetting the current frame first.
-            -- This lets Abort preserve the exact state the user was looking at.
-		    CO.RestoreAnchors()
-		    CO.ResetTargets()
-		    CO.Stop()
+            if PreserveCurrentFrame and CO.HoldCurrentState then
+                pcall(CO.HoldCurrentState)
+            else
+                pcall(CO.RestoreAnchors)
+            end
+            CO.ResetTargets()
+            if not PreserveCurrentFrame then
+                CO.Stop()
+            end
+
 			UnblockInputs() -- Enable scrolling and clicks
 			if ReplayCharacterCollisionStates and Character then
 				for part, canCollide in pairs(ReplayCharacterCollisionStates) do
@@ -5334,12 +5831,49 @@ do
             Frozen = true
             StopRecording()
             SaveRecording()
-            FreezeFrame = #ReplayTable
+            FreezeFrame = math.clamp(#ReplayTable, 1, math.max(#ReplayTable, 1))
             ReleaseAllPlaybackKeys()
+            CO.ResetTargets()
             CO.AnchorAll()
+
+            if workspace.CurrentCamera and not (movecameraonfroze and movecameraonfroze.Value) then
+                FrozenCameraType = workspace.CurrentCamera.CameraType
+                pcall(function()
+                    FrozenMouseBehavior = UserInputService.MouseBehavior
+                    UserInputService.MouseBehavior = Enum.MouseBehavior.LockCurrentPosition
+                end)
+                workspace.CurrentCamera.CameraType = Enum.CameraType.Scriptable
+                local f = ReplayTable[math.clamp(RoundNumber(FreezeFrame, 0), 1, math.max(#ReplayTable, 1))]
+                if type(f) == "table" and f[7] then
+                    FrozenCameraCFrame = TableToCFrame(f[7])
+                    workspace.CurrentCamera.CFrame = FrozenCameraCFrame
+                else
+                    FrozenCameraCFrame = workspace.CurrentCamera.CFrame
+                end
+
+                pcall(function()
+                    RunService:BindToRenderStep(FrozenCameraBindName, Enum.RenderPriority.Camera.Value + 10, function()
+                        if not Frozen then return end
+                        local cam = workspace.CurrentCamera
+                        if cam then
+                            cam.CameraType = Enum.CameraType.Scriptable
+                            if FrozenCameraCFrame then
+                                cam.CFrame = FrozenCameraCFrame
+                            end
+                        end
+                    end)
+                end)
+            end
             SetColorCodeFrame("Frozen")
         else
+            pcall(function() RunService:UnbindFromRenderStep(FrozenCameraBindName) end)
             CO.RestoreAnchors()
+            CO.ResetTargets()
+            if FrozenCameraType and workspace.CurrentCamera then
+                workspace.CurrentCamera.CameraType = FrozenCameraType
+                FrozenCameraType = nil
+            end
+            FrozenCameraCFrame = nil
             Frozen = false
             pcall(function()
                 if Character and Character:FindFirstChild("HumanoidRootPart") then
@@ -5650,6 +6184,13 @@ end
     CurrentCamera_Changed = function()
         if Reading then
             workspace.CurrentCamera.CFrame = CameraCFrame
+        elseif Frozen and not (movecameraonfroze and movecameraonfroze.Value) then
+            local idx = math.clamp(RoundNumber(FreezeFrame, 0), 1, #ReplayTable)
+            local f = ReplayTable[idx]
+            if type(f) == "table" and f[7] then
+                workspace.CurrentCamera.CameraType = Enum.CameraType.Scriptable
+                workspace.CurrentCamera.CFrame = TableToCFrame(f[7])
+            end
         end
     end
 	ConsoleInput.Callback = function(self, value)
@@ -5829,12 +6370,8 @@ do -- Setup
 
     -- Prepare CO in the background. This moves the expensive workspace scan
     -- out of the recording hot path, so pressing the record key is immediate.
-    task.spawn(function()
-        pcall(function()
-            if not CO._initialized then
-                CO.Init()
-            end
-        end)
+    pcall(function()
+        CO.QueueInitialization()
     end)
 end
 
@@ -6097,14 +6634,14 @@ spawn(function() -- Reading Loop
             HRP.Velocity = cache.hrpVel
             HRP.RotVelocity = cache.hrpRotVel
 
-            -- Client objects from Frame[13], also applied strictly to their
-            -- recorded CFrames. Unchanged objects stay on their last target.
-            local coData = Frame[13]
-            if coData == nil then
-                CO.WarnNoCOData()
-            else
-                CO.ApplyFrame(coData, 0)
-            end
+            -- Client objects are interpolated between the current TAS sample
+            -- and the next sample. This keeps spinners and other moving KOs
+            -- visually smooth without changing the recorded TAS timeline.
+            local coData = Frame[13] or {}
+            local nextFrame = (ReplayTableIndex < #ReplayTable) and ReplayTable[ReplayTableIndex + 1] or nil
+            local nextCO = type(nextFrame) == "table" and nextFrame[13] or nil
+            local coAlpha = math.clamp(playbackAccumulator / playbackInterval, 0, 1)
+            CO.ApplyInterpolatedFrame(coData, nextCO, coAlpha)
 
             lastVelocity = currentVelocity
 
@@ -6323,6 +6860,8 @@ oldConsoleMessage = hookfunction(ConsoleMessage,function(...)
 	end
 end)]]
 
+local LastProcessedFreezeFrame = nil
+local CachedFreezePressedKeys = {}
 local function ProcessFreezeFrame(RoundedFreezeFrame)
     local Frame = ReplayTable[RoundedFreezeFrame]
     if type(Frame) ~= "table" then return end
@@ -6338,20 +6877,25 @@ local function ProcessFreezeFrame(RoundedFreezeFrame)
         end
     end
 
-    local CurrentPressedKeys = {}
-    for Index = RoundedFreezeFrame - math.max(FrameBacktrackCount, 0), RoundedFreezeFrame do
-        local F = ReplayTable[Index]
-        if F and type(F) == "table" then
-            local BeganInputs, EndedInputs = unpack(F[12])
-            for _, Key in pairs(BeganInputs) do
-                if Key ~= "u" and Key ~= "d" then
-                    CurrentPressedKeys[Key] = true
+    local CurrentPressedKeys = CachedFreezePressedKeys
+    if LastProcessedFreezeFrame ~= RoundedFreezeFrame then
+        CurrentPressedKeys = {}
+        for Index = RoundedFreezeFrame - math.max(FrameBacktrackCount, 0), RoundedFreezeFrame do
+            local F = ReplayTable[Index]
+            if F and type(F) == "table" then
+                local BeganInputs, EndedInputs = unpack(F[12] or {{}, {}})
+                for _, Key in pairs(BeganInputs or {}) do
+                    if Key ~= "u" and Key ~= "d" then
+                        CurrentPressedKeys[Key] = true
+                    end
+                end
+                for _, Key in pairs(EndedInputs or {}) do
+                    CurrentPressedKeys[Key] = nil
                 end
             end
-            for _, Key in pairs(EndedInputs) do
-                CurrentPressedKeys[Key] = nil
-            end
         end
+        CachedFreezePressedKeys = CurrentPressedKeys
+        LastProcessedFreezeFrame = RoundedFreezeFrame
     end
 
     WritingPressedKeysLabel.Text = "Writing Pressed keys: |"
@@ -6386,20 +6930,25 @@ local function ProcessFreezeFrame(RoundedFreezeFrame)
     Character.HumanoidRootPart.RotVelocity = HumanoidRootPartRotVelocity
     Character.HumanoidRootPart.CFrame = HumanoidRootPartCFrame
 
-    if not movecameraonfroze.Value then
-        workspace.CurrentCamera.CFrame = FrameCameraCFrame
-        SetZoom(Zoom)
-        if FrameShiftLock ~= GetShiftLockEnabled() then
-            SetShiftLockEnabled(FrameShiftLock)
+    if not (movecameraonfroze and movecameraonfroze.Value) then
+        FrozenCameraCFrame = FrameCameraCFrame
+        local cam = workspace.CurrentCamera
+        if cam then
+            cam.CameraType = Enum.CameraType.Scriptable
+            cam.CFrame = FrozenCameraCFrame
         end
-    end
-    if PlaybackMouseLocation then
-        mousemoveabs(MouseLocation.X, MouseLocation.Y)
+        pcall(function()
+            UserInputService.MouseBehavior = Enum.MouseBehavior.LockCurrentPosition
+        end)
+        SetZoom(Zoom)
+        -- Do not feed mouse/shift-lock input while frozen. The recorded camera
+        -- CFrame is authoritative here.
     end
 
- if #ReplayTable > 0 then
+    if #ReplayTable > 0 then
         local coState = CO.GetFullStateAtFrame(RoundedFreezeFrame, ReplayTable)
         CO.ApplyFullState(coState)
+        CO.AnchorAll()
     end
 end
 
@@ -6409,10 +6958,19 @@ spawn(function() -- Handling freezing
             Character.HumanoidRootPart.Anchored = true
             if FreezeFrame > 0 and FreezeFrame <= #ReplayTable then
                 local RoundedFreezeFrame = RoundNumber(FreezeFrame, 0)
-                ConsoleMessage(FreezeFrame, RoundedFreezeFrame)
-                ProcessFreezeFrame(RoundedFreezeFrame)
+                if LastProcessedFreezeFrame ~= RoundedFreezeFrame then
+                    ProcessFreezeFrame(RoundedFreezeFrame)
+                else
+                    CO.AnchorAll()
+                end
+                if not (movecameraonfroze and movecameraonfroze.Value) and FrozenCameraCFrame and workspace.CurrentCamera then
+                    workspace.CurrentCamera.CameraType = Enum.CameraType.Scriptable
+                    workspace.CurrentCamera.CFrame = FrozenCameraCFrame
+                end
             end
         else
+            LastProcessedFreezeFrame = nil
+            CachedFreezePressedKeys = {}
             pcall(function()
                 Character.HumanoidRootPart.Anchored = false
             end)
@@ -6427,7 +6985,7 @@ do -- Set checkpoint
     local initialReplay, initialReplayFPS = ReplayDecode(fileContent)
     ReplayTable = initialReplay
     ReplaySaveState.Version = ReplaySaveState.Version + 1
-    ReplaySaveState.Encoded = (type(fileContent) == "string" and fileContent:sub(1, 4) == "TAS5") and fileContent or nil
+    ReplaySaveState.Encoded = (type(fileContent) == "string" and fileContent ~= "") and fileContent or nil
     ReplaySaveState.EncodedVersion = ReplaySaveState.Encoded and ReplaySaveState.Version or -1
     ReplaySourceFPS = math.max(1, tonumber(initialReplayFPS or TASRecordingFPS) or 1)
     ActiveReplayFPS = math.max(1, tonumber(ReplaySourceFPS or TASRecordingFPS) or 1)
