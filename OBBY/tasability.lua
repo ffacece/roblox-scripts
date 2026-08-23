@@ -1,3 +1,5 @@
+-- PLAYBACK SPEED FIX: restored stable TAS frame timing; interpolation never advances ReplayTableIndex.
+-- TASABILITY PATCH MARKER: CO_REGISTER_SCOPE_V3
 -- Config
 local FPS = 120 -- Client FPS cap. This can be higher than the TAS recording/playback FPS.
 local TASRecordingFPS = 60 -- TAS samples recorded per second. Client FPS can be higher. Playback uses this saved FPS.
@@ -50,7 +52,7 @@ local Cursors = {
 }
 
 -- Constants
-local Version = "V1.2.5-TAS5"
+local Version = "V1.2.5"
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
@@ -102,23 +104,18 @@ local SteppedConnections = {}
 local FolderPath = "Tasability\\"..tostring(PlaceId)
 local ReplayPath = FolderPath.."\\Replay.json"
 if isfolder(FolderPath) then
-    local legacyReplayPath = nil
-    local jsonReplayPath = nil
+    local legacyReplayPath, jsonReplayPath
     for _, filePath in ipairs(listfiles(FolderPath)) do
         if type(filePath) == "string" then
             local lowerPath = filePath:lower()
-            if lowerPath:sub(-5) == ".json" and not jsonReplayPath then
+            if not jsonReplayPath and lowerPath:sub(-5) == ".json" then
                 jsonReplayPath = filePath
-            elseif lowerPath:sub(-4) == ".tas" and not legacyReplayPath then
+            elseif not legacyReplayPath and lowerPath:sub(-4) == ".tas" then
                 legacyReplayPath = filePath
             end
         end
     end
-    if jsonReplayPath then
-        ReplayPath = jsonReplayPath
-    elseif legacyReplayPath then
-        ReplayPath = legacyReplayPath
-    end
+    ReplayPath = jsonReplayPath or legacyReplayPath or ReplayPath
 end
 local AHKConnectionFolderPath = "Replayability+_AHK"
 local AHKConnectionRequestPath = "Replayability+_AHK/Request"
@@ -128,6 +125,13 @@ local RecordingFPSCapActive = false -- Compatibility flag; recording never chang
 local RecordingReplayFPS = nil -- FPS used by the currently buffered recording.
 local ActiveReplayFPS = TASRecordingFPS -- Playback FPS follows the replay recording FPS.
 local ReplaySourceFPS = TASRecordingFPS -- FPS the replay data was recorded/saved at.
+
+-- Forward declarations used by GUI callbacks before replay functions are assigned.
+local ReplayEncode, RecordReplay, StartRecording, StopRecording
+local SaveRecording, DiscardRecording, StartReading, StopReading
+local GetCheckpoint, SetCheckpoint, GotoFrame, ResetCurrentRecording
+-- Default: game scripts/pads are allowed to change physics values during playback.
+AllowChangingPhysics = true -- TAS6: game/boost pads may change physics during playback
 
 local TASCompressionLevel = 3 -- Save-only Zstd level. Lower = faster save, higher = smaller file. Playback is unaffected.
 local ReplaySaveState = {Version = 0, Encoded = nil, EncodedVersion = -1} -- Save-only cache; never used by playback.
@@ -169,6 +173,22 @@ local FrozenCameraType = nil
 local FrozenCameraBindName = "TasabilityFrozenCamera"
 local FrozenCameraCFrame = nil
 local FrozenHeldCO = false
+
+-- Playback-pause state. Pause freezes the character and camera without touching the mouse.
+local PausedCharacterCFrame = nil
+local PausedCameraCFrame = nil
+local PausedCameraType = nil
+local PausedCameraBindName = "TasabilityPausedCamera"
+local PendingRecordingFlush = false
+local FIRST_RECORD_FIX = "CO_READY_BEFORE_WRITE__KEEP_CO_ON_RESET__READ_FROM_DISK_AFTER_SAVE"
+local CachedAnimateScript = nil
+local PlaybackWarmCache = {}
+
+-- Camera/Input functions are used by GUI/HUD callbacks defined earlier in the file.
+-- Keep these locals declared before those callbacks so they do not resolve as globals.
+local GetZoom, SetZoom, GetShiftLockEnabled, SetShiftLockEnabled
+local SetCameraCFrame, BlockInputs, UnblockInputs, SetCursor
+
 
 -- Converting inputs
 -- To add to this table, use https://docs.microsoft.com/en-us/windows/win32/inputdev/virtual-key-codes
@@ -706,7 +726,8 @@ local function updateTracer()
     -- Simulate trajectory
     local pos = RootPart.Position
     local vel = RootPart.Velocity
-    local points = {pos}
+    local points = table.create(TRACER_STEPS + 1)
+    points[1] = pos
 
     local onGround = Humanoid and (
         Humanoid:GetState() == Enum.HumanoidStateType.Running or
@@ -715,30 +736,26 @@ local function updateTracer()
 
     for i = 1, TRACER_STEPS do
         if onGround then
-            -- On ground: just extrapolate flat velocity
             pos = pos + vel * dt
         else
-            -- In air: apply gravity
             vel = vel + gravity * dt
             pos = pos + vel * dt
         end
-        table.insert(points, pos)
+        points[i + 1] = pos
     end
 
     -- Draw lines between points
-    for i = 1, #points - 1 do
+    local nPoints = #points
+    local tDenom = nPoints - 2
+    for i = 1, nPoints - 1 do
         local line = TracerLines[i]
         if not line then continue end
-
         local s1, on1 = cam:WorldToViewportPoint(points[i])
         local s2, on2 = cam:WorldToViewportPoint(points[i + 1])
-
         if on1 and on2 then
             line.From = Vector2.new(s1.X, s1.Y)
             line.To   = Vector2.new(s2.X, s2.Y)
-
-            -- Color gradient: green at start -> red at end
-            local t = (i - 1) / (#points - 2)
+            local t = (i - 1) / tDenom
             line.Color = Color3.fromRGB(
                 math.floor(50  + 205 * t),
                 math.floor(255 - 205 * t),
@@ -759,263 +776,6 @@ RenderSteppedConnections.GhostAndTracer = function()
         clearTracerLines()
     end
 end
-
-
-local StatsHudEnabled = false
-local StatsHudGui = nil
- 
-local function createStatsHud()
-    if StatsHudGui then StatsHudGui:Destroy() end
- 
-    -- ── Colors (match main GUI theme) ────────────────────────────
-    local HUD_BG       = Color3.fromRGB(10, 10, 14)
-    local HUD_INLINE   = Color3.fromRGB(21, 21, 28)
-    local HUD_BORDER   = Color3.fromRGB(8, 8, 12)
-    local HUD_OUTLINE  = Color3.fromRGB(30, 30, 40)
-    local HUD_ACCENT   = Color3.fromRGB(100, 175, 255)
-    local HUD_TEXT      = Color3.fromRGB(215, 215, 228)
-    local HUD_MUTED     = Color3.fromRGB(115, 115, 138)
-    local HUD_TXTSHADOW = Color3.fromRGB(0, 0, 0)
- 
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "TAS_StatsHud"
-    gui.ResetOnSpawn = false
-    gui.DisplayOrder = 9998
-    gui.IgnoreGuiInset = true
-    gui.Parent = Player.PlayerGui
- 
-    -- Main frame
-    local frame = Instance.new("Frame")
-    frame.Name = "StatsFrame"
-    frame.Size = UDim2.new(0, 290, 0, 310)
-    frame.Position = UDim2.new(0, 10, 1, -320)
-    frame.BackgroundColor3 = HUD_BG
-    frame.BorderSizePixel = 2
-    frame.BorderColor3 = HUD_BORDER
-    frame.Parent = gui
- 
-    -- Outline stroke
-    local stroke = Instance.new("UIStroke")
-    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-    stroke.LineJoinMode = Enum.LineJoinMode.Miter
-    stroke.Color = HUD_OUTLINE
-    stroke.Thickness = 1
-    stroke.Parent = frame
- 
-    -- Accent line at top
-    local accentLine = Instance.new("Frame")
-    accentLine.Size = UDim2.new(1, 0, 0, 2)
-    accentLine.Position = UDim2.new(0, 0, 0, 0)
-    accentLine.BackgroundColor3 = HUD_ACCENT
-    accentLine.BorderSizePixel = 0
-    accentLine.ZIndex = 3
-    accentLine.Parent = frame
- 
-    local accentGrad = Instance.new("UIGradient")
-    accentGrad.Rotation = 90
-    accentGrad.Color = ColorSequence.new{
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 255, 255)),
-        ColorSequenceKeypoint.new(1, Color3.fromRGB(65, 65, 65)),
-    }
-    accentGrad.Parent = accentLine
- 
-    -- Title
-    local titleLbl = Instance.new("TextLabel")
-    titleLbl.Size = UDim2.new(1, 0, 0, 18)
-    titleLbl.Position = UDim2.new(0, 8, 0, 4)
-    titleLbl.BackgroundTransparency = 1
-    titleLbl.Text = "STATS HUD"
-    titleLbl.TextColor3 = HUD_ACCENT
-    titleLbl.Font = Enum.Font.GothamBold
-    titleLbl.TextSize = 11
-    titleLbl.TextXAlignment = Enum.TextXAlignment.Left
-    titleLbl.Parent = frame
- 
-    local titleShadow = Instance.new("UIStroke")
-    titleShadow.LineJoinMode = Enum.LineJoinMode.Miter
-    titleShadow.Color = HUD_TXTSHADOW
-    titleShadow.Parent = titleLbl
- 
-    -- Separator below title
-    local sep = Instance.new("Frame")
-    sep.Size = UDim2.new(1, -16, 0, 1)
-    sep.Position = UDim2.new(0, 8, 0, 22)
-    sep.BackgroundColor3 = HUD_OUTLINE
-    sep.BorderSizePixel = 0
-    sep.Parent = frame
- 
-    -- Content area
-    local content = Instance.new("Frame")
-    content.Size = UDim2.new(1, -16, 1, -30)
-    content.Position = UDim2.new(0, 8, 0, 26)
-    content.BackgroundTransparency = 1
-    content.BorderSizePixel = 0
-    content.Parent = frame
- 
-    local layout = Instance.new("UIListLayout")
-    layout.Padding = UDim.new(0, 2)
-    layout.SortOrder = Enum.SortOrder.LayoutOrder
-    layout.Parent = content
- 
-    -- Auto-resize
-    layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-        frame.Size = UDim2.new(0, 290, 0, layout.AbsoluteContentSize.Y + 34)
-        frame.Position = UDim2.new(0, 10, 1, -(layout.AbsoluteContentSize.Y + 44))
-    end)
- 
-    -- ── Label factory ────────────────────────────────────────────
-    local function makeHeader(text)
-        local lbl = Instance.new("TextLabel")
-        lbl.Size = UDim2.new(1, 0, 0, 16)
-        lbl.BackgroundTransparency = 1
-        lbl.Text = text
-        lbl.TextColor3 = HUD_ACCENT
-        lbl.Font = Enum.Font.GothamBold
-        lbl.TextSize = 10
-        lbl.TextXAlignment = Enum.TextXAlignment.Left
-        lbl.Parent = content
-        local s = Instance.new("UIStroke")
-        s.LineJoinMode = Enum.LineJoinMode.Miter
-        s.Color = HUD_TXTSHADOW
-        s.Parent = lbl
-        return lbl
-    end
- 
-    local function makeLabel(name, defaultText)
-        local lbl = Instance.new("TextLabel")
-        lbl.Name = name
-        lbl.Size = UDim2.new(1, 0, 0, 15)
-        lbl.BackgroundTransparency = 1
-        lbl.Text = defaultText
-        lbl.RichText = true
-        lbl.TextColor3 = HUD_TEXT
-        lbl.Font = Enum.Font.GothamMedium
-        lbl.TextSize = 12
-        lbl.TextXAlignment = Enum.TextXAlignment.Left
-        lbl.Parent = content
-        local s = Instance.new("UIStroke")
-        s.LineJoinMode = Enum.LineJoinMode.Miter
-        s.Color = HUD_TXTSHADOW
-        s.Parent = lbl
-        return lbl
-    end
- 
-    local function makeDivider()
-        local div = Instance.new("Frame")
-        div.Size = UDim2.new(1, 0, 0, 1)
-        div.BackgroundColor3 = HUD_OUTLINE
-        div.BackgroundTransparency = 0.5
-        div.BorderSizePixel = 0
-        div.Parent = content
-    end
- 
-    -- ── Build labels ─────────────────────────────────────────────
-    makeHeader("POSITION")
-    local posX   = makeLabel("PosX",   "X: 0.000")
-    local posY   = makeLabel("PosY",   "Y: 0.000")
-    local posZ   = makeLabel("PosZ",   "Z: 0.000")
-    makeDivider()
-    makeHeader("VELOCITY")
-    local velX   = makeLabel("VelX",   "X: 0.000")
-    local velY   = makeLabel("VelY",   "Y: 0.000")
-    local velZ   = makeLabel("VelZ",   "Z: 0.000")
-    local velMag = makeLabel("VelMag", "Magnitude: 0.000")
-    makeDivider()
-    makeHeader("ROTATION")
-    local rotX   = makeLabel("RotX",   "Pitch: 0.00°")
-    local rotY   = makeLabel("RotY",   "Yaw:   0.00°")
-    local rotZ   = makeLabel("RotZ",   "Roll:  0.00°")
-    makeDivider()
-    makeHeader("CHARACTER")
-    local stateLabel = makeLabel("State", "State: None")
-    local floorLabel = makeLabel("Floor", "Floor: None")
-    local jumpLabel  = makeLabel("Jump",  "JumpPower: 50")
-    local wsLabel    = makeLabel("WS",    "WalkSpeed: 16")
-    local gravLabel  = makeLabel("Grav",  "Gravity: 196.2")
-    makeDivider()
-    makeHeader("REPLAY")
-    local frameLabel = makeLabel("Frame", "Frame: 0 / 0")
-    local timeLabel  = makeLabel("Time",  "Time:  0.00s")
-    local zoomLabel  = makeLabel("Zoom",  "Zoom:  0.00")
-    makeDivider()
-    makeHeader("CSYNC")
-    local coPartLabel  = makeLabel("COParts", "Tracked: 0")
-    local coFrameLabel = makeLabel("COState", "CO State: idle")
- 
-    -- ── Update loop ──────────────────────────────────────────────
-    local hudAccumulator = 0
-    local updateConn = RunService.RenderStepped:Connect(function(dt)
-        if not StatsHudEnabled or not StatsHudGui then return end
-        if not RootPart or not Humanoid then return end
-        hudAccumulator = hudAccumulator + (dt or 0)
-        if hudAccumulator < (1 / 15) then return end
-        hudAccumulator = 0
- 
-        local pos = RootPart.Position
-        posX.Text = string.format("X: <font color='#ff8080'>%.4f</font>", pos.X)
-        posY.Text = string.format("Y: <font color='#80ff80'>%.4f</font>", pos.Y)
-        posZ.Text = string.format("Z: <font color='#8080ff'>%.4f</font>", pos.Z)
- 
-        local vel = RootPart.Velocity
-        velX.Text   = string.format("X: <font color='#ff8080'>%.4f</font>", vel.X)
-        velY.Text   = string.format("Y: <font color='#80ff80'>%.4f</font>", vel.Y)
-        velZ.Text   = string.format("Z: <font color='#8080ff'>%.4f</font>", vel.Z)
-        velMag.Text = string.format("Magnitude: <font color='#ffdc50'>%.4f</font>", vel.Magnitude)
- 
-        local rx, ry, rz = RootPart.CFrame:ToOrientation()
-        rotX.Text = string.format("Pitch: <font color='#ff8080'>%.2f°</font>", math.deg(rx))
-        rotY.Text = string.format("Yaw:   <font color='#80ff80'>%.2f°</font>", math.deg(ry))
-        rotZ.Text = string.format("Roll:  <font color='#8080ff'>%.2f°</font>", math.deg(rz))
- 
-        local stateStr = tostring(Humanoid:GetState()):gsub("Enum.HumanoidStateType.", "")
-        local sc = "#ffffff"
-        if stateStr == "Jumping" or stateStr == "Freefall" then sc = "#80ff80"
-        elseif stateStr == "Running" then sc = "#ffdc50"
-        elseif stateStr == "Climbing" then sc = "#ff9650"
-        elseif stateStr == "Dead" then sc = "#ff5050" end
-        stateLabel.Text = string.format("State: <font color='%s'>%s</font>", sc, stateStr)
- 
-        local floorMat = tostring(Humanoid.FloorMaterial):gsub("Enum.Material.", "")
-        floorLabel.Text = string.format("Floor: <font color='#aaaaff'>%s</font>", floorMat)
-        jumpLabel.Text  = string.format("JumpPower: <font color='#c8c8ff'>%.1f</font>", Humanoid.JumpPower)
-        wsLabel.Text    = string.format("WalkSpeed: <font color='#c8c8ff'>%.1f</font>", Humanoid.WalkSpeed)
-        gravLabel.Text  = string.format("Gravity: <font color='#c8c8ff'>%.2f</font>", workspace.Gravity)
- 
-        local totalFrames = #ReplayTable
-        local cf = Frozen and RoundNumber(FreezeFrame, 0) or (Reading and ReplayTableIndex or 0)
-        frameLabel.Text = string.format("Frame: <font color='#64afff'>%d / %d</font>", cf, totalFrames)
-        timeLabel.Text  = string.format("Time:  <font color='#64afff'>%.2fs</font>", cf / math.max(ReplaySourceFPS or TASRecordingFPS or 1, 1))
- 
-        local zoom = GetZoom()
-        zoomLabel.Text = string.format("Zoom:  <font color='#64afff'>%.2f</font>", zoom)
- 
-        -- CSync info
-        local partCount = CO.GetPartCount and CO.GetPartCount() or 0
-        coPartLabel.Text = string.format("Tracked: <font color='#64afff'>%d</font> parts", partCount)
-        local coStatus = "idle"
-        if Writing then coStatus = "recording"
-        elseif Reading then coStatus = "playing"
-        elseif Frozen then coStatus = "frozen" end
-        coFrameLabel.Text = string.format("CO State: <font color='#64afff'>%s</font>", coStatus)
-    end)
- 
-    getgenv().StatsHudConnection = updateConn
-    StatsHudGui = gui
-    ConsoleMessage("Stats HUD enabled")
-end
- 
-local function destroyStatsHud()
-    if getgenv().StatsHudConnection then
-        getgenv().StatsHudConnection:Disconnect()
-        getgenv().StatsHudConnection = nil
-    end
-    if StatsHudGui then
-        StatsHudGui:Destroy()
-        StatsHudGui = nil
-    end
-    ConsoleMessage("Stats HUD disabled")
-end
-
 
 -- Fast conversion functions for better performance
 local function FastTableToCFrame(t)
@@ -1042,14 +802,14 @@ local WaitForInput -- WaitForInput() -> nil
 do
 	RandomString = function()
 		local str = ""
-		for _ = 1,random(1,20) do
-			local type = random(1,3)
-			if type == 1 then
-				str = str..string.char(random(97,122)) -- Lowercase
-			elseif type == 2 then
-				str = str..string.char(random(65,90)) -- Uppercase
-			elseif type == 3 then
-				str = str..string.char(random(48,57)) -- Numbers
+		for _ = 1, random(1, 20) do
+			local t = random(1, 3)
+			if t == 1 then
+				str = str .. string.char(random(97, 122))
+			elseif t == 2 then
+				str = str .. string.char(random(65, 90))
+			else
+				str = str .. string.char(random(48, 57))
 			end
 		end
 		return str
@@ -1106,16 +866,92 @@ do
 end
 
 local function ReleaseAllPlaybackKeys()
-    for Input, Code in pairs(PlaybackPressedKeys) do
-        if Code == "b1" then
-            mouse1release()
-        elseif Code == "b2" then
-            mouse2release()
-        elseif type(Code) == "number" then
-            keyrelease(Code)
+    for _, Code in pairs(PlaybackPressedKeys) do
+        if Code == "b1" then mouse1release()
+        elseif Code == "b2" then mouse2release()
+        elseif type(Code) == "number" then keyrelease(Code)
         end
     end
     PlaybackPressedKeys = {}
+end
+
+local function BeginPlaybackPause()
+    if not Reading then return end
+
+    ReleaseAllPlaybackKeys()
+    PlaybackAccumulator = 0
+
+    if Character and Character:FindFirstChild("HumanoidRootPart") then
+        local hrp = Character.HumanoidRootPart
+        PausedCharacterCFrame = hrp.CFrame
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+        hrp.Velocity = Vector3.zero
+        hrp.RotVelocity = Vector3.zero
+    else
+        PausedCharacterCFrame = nil
+    end
+
+    local cam = workspace.CurrentCamera
+    if cam then
+        PausedCameraCFrame = cam.CFrame
+        PausedCameraType = cam.CameraType
+        cam.CameraType = Enum.CameraType.Scriptable
+    else
+        PausedCameraCFrame = nil
+        PausedCameraType = nil
+    end
+
+    pcall(function()
+        RunService:UnbindFromRenderStep(PausedCameraBindName)
+        RunService:BindToRenderStep(PausedCameraBindName, Enum.RenderPriority.Camera.Value + 10, function()
+            if not Paused or not Reading then return end
+            local currentCam = workspace.CurrentCamera
+            if currentCam and PausedCameraCFrame then
+                currentCam.CameraType = Enum.CameraType.Scriptable
+                currentCam.CFrame = PausedCameraCFrame
+            end
+        end)
+    end)
+end
+
+local function HoldPlaybackPausedState()
+    if not Reading or not Paused then return end
+
+    if Character and Character:FindFirstChild("HumanoidRootPart") then
+        local hrp = Character.HumanoidRootPart
+        if PausedCharacterCFrame then
+            hrp.CFrame = PausedCharacterCFrame
+        end
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+        hrp.Velocity = Vector3.zero
+        hrp.RotVelocity = Vector3.zero
+        if Humanoid then
+            Humanoid.PlatformStand = true
+        end
+    end
+
+    local cam = workspace.CurrentCamera
+    if cam and PausedCameraCFrame then
+        cam.CameraType = Enum.CameraType.Scriptable
+        cam.CFrame = PausedCameraCFrame
+    end
+end
+
+local function EndPlaybackPause()
+    pcall(function()
+        RunService:UnbindFromRenderStep(PausedCameraBindName)
+    end)
+
+    local cam = workspace.CurrentCamera
+    if cam and PausedCameraType then
+        cam.CameraType = PausedCameraType
+    end
+
+    PausedCharacterCFrame = nil
+    PausedCameraCFrame = nil
+    PausedCameraType = nil
 end
 
 
@@ -1146,7 +982,7 @@ pcall(function()
 end)
 
 -- ── Utilities ────────────────────────────────────────────────────────────────
-local function tw(obj, props, dur, style)
+function tw(obj, props, dur, style)
     TweenService:Create(
         obj,
         TweenInfo.new(dur or 0.22, style or Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
@@ -1154,7 +990,7 @@ local function tw(obj, props, dur, style)
     ):Play()
 end
 
-local function mk(cls, props)
+function mk(cls, props)
     local inst = Instance.new(cls)
     for k, v in pairs(props) do inst[k] = v end
     return inst
@@ -1256,12 +1092,12 @@ local ThemePresets = {
     },
 }
 
-local function applyTheme(inst, prop, key)
+function applyTheme(inst, prop, key)
     inst[prop] = Theme[key]
     table.insert(ThemeBindings, {inst, prop, key})
 end
 
-local function refreshAllTheme()
+function refreshAllTheme()
     for _, b in ipairs(ThemeBindings) do
         if b[1] and b[1].Parent then
             pcall(function() b[1][b[2]] = Theme[b[3]] end)
@@ -1269,19 +1105,304 @@ local function refreshAllTheme()
     end
 end
 
-local function setThemePreset(name)
+function setThemePreset(name)
     local p = ThemePresets[name]
     if not p then return end
     for k, v in pairs(p) do Theme[k] = v end
     refreshAllTheme()
 end
 
+local StatsHudEnabled = false
+local StatsHudGui = nil
+ 
+function createStatsHud()
+    if StatsHudGui then StatsHudGui:Destroy() end
+ 
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "TAS_StatsHud"
+    gui.ResetOnSpawn = false
+    gui.DisplayOrder = 9998
+    gui.IgnoreGuiInset = true
+    gui.Parent = Player.PlayerGui
+ 
+    -- Main frame
+    local frame = Instance.new("Frame")
+    frame.Name = "StatsFrame"
+    frame.Size = UDim2.new(0, 290, 0, 310)
+    frame.Position = UDim2.new(0, 10, 1, -320)
+    frame.BackgroundColor3 = Theme.bg_deep
+    frame.BorderSizePixel = 2
+    frame.BorderColor3 = Theme.border
+    frame.Parent = gui
+ 
+    -- Outline stroke
+    local stroke = Instance.new("UIStroke")
+    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    stroke.LineJoinMode = Enum.LineJoinMode.Miter
+    stroke.Color = Theme.outline
+    stroke.Thickness = 1
+    stroke.Parent = frame
+ 
+    -- Accent line at top
+    local accentLine = Instance.new("Frame")
+    accentLine.Size = UDim2.new(1, 0, 0, 2)
+    accentLine.Position = UDim2.new(0, 0, 0, 0)
+    accentLine.BackgroundColor3 = Theme.accent
+    accentLine.BorderSizePixel = 0
+    accentLine.ZIndex = 3
+    accentLine.Parent = frame
+ 
+    local accentGrad = Instance.new("UIGradient")
+    accentGrad.Rotation = 90
+    accentGrad.Color = ColorSequence.new{
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 255, 255)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(65, 65, 65)),
+    }
+    accentGrad.Parent = accentLine
+ 
+    -- Title
+    local titleLbl = Instance.new("TextLabel")
+    titleLbl.Size = UDim2.new(1, 0, 0, 18)
+    titleLbl.Position = UDim2.new(0, 8, 0, 4)
+    titleLbl.BackgroundTransparency = 1
+    titleLbl.Text = "STATS HUD"
+    titleLbl.TextColor3 = Theme.accent
+    titleLbl.Font = Enum.Font.GothamBold
+    titleLbl.TextSize = 11
+    titleLbl.TextXAlignment = Enum.TextXAlignment.Left
+    titleLbl.Parent = frame
+ 
+    local titleShadow = Instance.new("UIStroke")
+    titleShadow.LineJoinMode = Enum.LineJoinMode.Miter
+    titleShadow.Color = Theme.txt_shadow
+    titleShadow.Parent = titleLbl
+ 
+    -- Separator below title
+    local sep = Instance.new("Frame")
+    sep.Size = UDim2.new(1, -16, 0, 1)
+    sep.Position = UDim2.new(0, 8, 0, 22)
+    sep.BackgroundColor3 = Theme.outline
+    sep.BorderSizePixel = 0
+    sep.Parent = frame
+ 
+    -- Content area
+    local content = Instance.new("Frame")
+    content.Size = UDim2.new(1, -16, 1, -30)
+    content.Position = UDim2.new(0, 8, 0, 26)
+    content.BackgroundTransparency = 1
+    content.BorderSizePixel = 0
+    content.Parent = frame
+ 
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 2)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Parent = content
+ 
+    -- Auto-resize
+    layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        frame.Size = UDim2.new(0, 290, 0, layout.AbsoluteContentSize.Y + 34)
+        frame.Position = UDim2.new(0, 10, 1, -(layout.AbsoluteContentSize.Y + 44))
+    end)
+
+    -- Collect themed instances for live sync
+    local themedInstances = {
+        {frame,      "BackgroundColor3", "bg_deep"},
+        {frame,      "BorderColor3",     "border"},
+        {stroke,     "Color",            "outline"},
+        {accentLine, "BackgroundColor3", "accent"},
+        {titleLbl,   "TextColor3",       "accent"},
+        {titleShadow,"Color",            "txt_shadow"},
+        {sep,        "BackgroundColor3", "outline"},
+    }
+
+    -- Track all header labels and dividers for sync
+    local headerLabels = {}
+    local dividers = {}
+    local bodyLabels = {}
+
+    -- ── Label factory ─────────────────────────────────────────────
+    local function makeHeader(text)
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(1, 0, 0, 16)
+        lbl.BackgroundTransparency = 1
+        lbl.Text = text
+        lbl.TextColor3 = Theme.accent
+        lbl.Font = Enum.Font.GothamBold
+        lbl.TextSize = 10
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.Parent = content
+        local s = Instance.new("UIStroke")
+        s.LineJoinMode = Enum.LineJoinMode.Miter
+        s.Color = Theme.txt_shadow
+        s.Parent = lbl
+        table.insert(headerLabels, lbl)
+        table.insert(themedInstances, {lbl, "TextColor3", "accent"})
+        table.insert(themedInstances, {s,   "Color",      "txt_shadow"})
+        return lbl
+    end
+ 
+    local function makeLabel(name, defaultText)
+        local lbl = Instance.new("TextLabel")
+        lbl.Name = name
+        lbl.Size = UDim2.new(1, 0, 0, 15)
+        lbl.BackgroundTransparency = 1
+        lbl.Text = defaultText
+        lbl.RichText = true
+        lbl.TextColor3 = Theme.txt
+        lbl.Font = Enum.Font.GothamMedium
+        lbl.TextSize = 12
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.Parent = content
+        local s = Instance.new("UIStroke")
+        s.LineJoinMode = Enum.LineJoinMode.Miter
+        s.Color = Theme.txt_shadow
+        s.Parent = lbl
+        table.insert(bodyLabels, lbl)
+        table.insert(themedInstances, {lbl, "TextColor3", "txt"})
+        table.insert(themedInstances, {s,   "Color",      "txt_shadow"})
+        return lbl
+    end
+ 
+    local function makeDivider()
+        local div = Instance.new("Frame")
+        div.Size = UDim2.new(1, 0, 0, 1)
+        div.BackgroundColor3 = Theme.outline
+        div.BackgroundTransparency = 0.5
+        div.BorderSizePixel = 0
+        div.Parent = content
+        table.insert(dividers, div)
+        table.insert(themedInstances, {div, "BackgroundColor3", "outline"})
+    end
+ 
+    -- ── Build labels ─────────────────────────────────────────────
+    makeHeader("POSITION")
+    local posX   = makeLabel("PosX",   "X: 0.000")
+    local posY   = makeLabel("PosY",   "Y: 0.000")
+    local posZ   = makeLabel("PosZ",   "Z: 0.000")
+    makeDivider()
+    makeHeader("VELOCITY")
+    local velX   = makeLabel("VelX",   "X: 0.000")
+    local velY   = makeLabel("VelY",   "Y: 0.000")
+    local velZ   = makeLabel("VelZ",   "Z: 0.000")
+    local velMag = makeLabel("VelMag", "Magnitude: 0.000")
+    makeDivider()
+    makeHeader("ROTATION")
+    local rotX   = makeLabel("RotX",   "Pitch: 0.00°")
+    local rotY   = makeLabel("RotY",   "Yaw:   0.00°")
+    local rotZ   = makeLabel("RotZ",   "Roll:  0.00°")
+    makeDivider()
+    makeHeader("CHARACTER")
+    local stateLabel = makeLabel("State", "State: None")
+    local floorLabel = makeLabel("Floor", "Floor: None")
+    local jumpLabel  = makeLabel("Jump",  "JumpPower: 50")
+    local wsLabel    = makeLabel("WS",    "WalkSpeed: 16")
+    local gravLabel  = makeLabel("Grav",  "Gravity: 196.2")
+    makeDivider()
+    makeHeader("REPLAY")
+    local frameLabel = makeLabel("Frame", "Frame: 0 / 0")
+    local timeLabel  = makeLabel("Time",  "Time:  0.00s")
+    local zoomLabel  = makeLabel("Zoom",  "Zoom:  0.00")
+    makeDivider()
+    makeHeader("CSYNC")
+    local coPartLabel  = makeLabel("COParts", "Tracked: 0")
+    local coFrameLabel = makeLabel("COState", "CO State: idle")
+ 
+    -- ── Update loop ──────────────────────────────────────────────
+    local hudAccumulator = 0
+    local updateConn = RunService.RenderStepped:Connect(function(dt)
+        if not StatsHudEnabled or not StatsHudGui then return end
+        if not RootPart or not Humanoid then return end
+        hudAccumulator = hudAccumulator + (dt or 0)
+        if hudAccumulator < (1 / 15) then return end
+        hudAccumulator = 0
+ 
+        local pos = RootPart.Position
+        posX.Text = string.format("X: <font color='#ff8080'>%.4f</font>", pos.X)
+        posY.Text = string.format("Y: <font color='#80ff80'>%.4f</font>", pos.Y)
+        posZ.Text = string.format("Z: <font color='#8080ff'>%.4f</font>", pos.Z)
+ 
+        local vel = RootPart.Velocity
+        velX.Text   = string.format("X: <font color='#ff8080'>%.4f</font>", vel.X)
+        velY.Text   = string.format("Y: <font color='#80ff80'>%.4f</font>", vel.Y)
+        velZ.Text   = string.format("Z: <font color='#8080ff'>%.4f</font>", vel.Z)
+        velMag.Text = string.format("Magnitude: <font color='#ffdc50'>%.4f</font>", vel.Magnitude)
+ 
+        local rx, ry, rz = RootPart.CFrame:ToOrientation()
+        rotX.Text = string.format("Pitch: <font color='#ff8080'>%.2f°</font>", math.deg(rx))
+        rotY.Text = string.format("Yaw:   <font color='#80ff80'>%.2f°</font>", math.deg(ry))
+        rotZ.Text = string.format("Roll:  <font color='#8080ff'>%.2f°</font>", math.deg(rz))
+ 
+        local stateStr = tostring(Humanoid:GetState()):gsub("Enum.HumanoidStateType.", "")
+        local sc = "#ffffff"
+        if stateStr == "Jumping" or stateStr == "Freefall" then sc = "#80ff80"
+        elseif stateStr == "Running" then sc = "#ffdc50"
+        elseif stateStr == "Climbing" then sc = "#ff9650"
+        elseif stateStr == "Dead" then sc = "#ff5050" end
+        stateLabel.Text = string.format("State: <font color='%s'>%s</font>", sc, stateStr)
+ 
+        local floorMat = tostring(Humanoid.FloorMaterial):gsub("Enum.Material.", "")
+        floorLabel.Text = string.format("Floor: <font color='#aaaaff'>%s</font>", floorMat)
+        jumpLabel.Text  = string.format("JumpPower: <font color='#c8c8ff'>%.1f</font>", Humanoid.JumpPower)
+        wsLabel.Text    = string.format("WalkSpeed: <font color='#c8c8ff'>%.1f</font>", Humanoid.WalkSpeed)
+        gravLabel.Text  = string.format("Gravity: <font color='#c8c8ff'>%.2f</font>", workspace.Gravity)
+ 
+        local totalFrames = #ReplayTable
+        local cf = Frozen and RoundNumber(FreezeFrame, 0) or (Reading and ReplayTableIndex or 0)
+        frameLabel.Text = string.format("Frame: <font color='#64afff'>%d / %d</font>", cf, totalFrames)
+        timeLabel.Text  = string.format("Time:  <font color='#64afff'>%.2fs</font>", cf / math.max(ReplaySourceFPS or TASRecordingFPS or 1, 1))
+ 
+        local zoom = GetZoom()
+        zoomLabel.Text = string.format("Zoom:  <font color='#64afff'>%.2f</font>", zoom)
+ 
+        -- CSync info
+        local partCount = (CO and CO.GetPartCount) and CO.GetPartCount() or 0
+        coPartLabel.Text = string.format("Tracked: <font color='#64afff'>%d</font> parts", partCount)
+        local coStatus = "idle"
+        if Writing then coStatus = "recording"
+        elseif Reading then coStatus = "playing"
+        elseif Frozen then coStatus = "frozen" end
+        coFrameLabel.Text = string.format("CO State: <font color='#64afff'>%s</font>", coStatus)
+    end)
+ 
+    getgenv().StatsHudConnection = updateConn
+
+    -- ── Theme sync ───────────────────────────────────────────────
+    -- Re-apply all themed properties whenever refreshAllTheme() runs.
+    -- We hook into ThemeBindings by registering our instances directly.
+    for _, entry in ipairs(themedInstances) do
+        local inst, prop, key = entry[1], entry[2], entry[3]
+        table.insert(ThemeBindings, {inst, prop, key})
+    end
+
+    StatsHudGui = gui
+    ConsoleMessage("Stats HUD enabled")
+end
+ 
+function destroyStatsHud()
+    if getgenv().StatsHudConnection then
+        getgenv().StatsHudConnection:Disconnect()
+        getgenv().StatsHudConnection = nil
+    end
+    if StatsHudGui then
+        -- Remove stale HUD entries from ThemeBindings to avoid dead-instance buildup
+        local alive = {}
+        for _, b in ipairs(ThemeBindings) do
+            if b[1] and b[1].Parent then
+                table.insert(alive, b)
+            end
+        end
+        ThemeBindings = alive
+        StatsHudGui:Destroy()
+        StatsHudGui = nil
+    end
+    ConsoleMessage("Stats HUD disabled")
+end
 -- Persistent user settings. Stored per-place so different games keep separate configs.
 local TasSettingsPath = FolderPath .. "\\Settings.json"
 TasSettings = rawget(_G, "TasSettings") or {}
 _G.TasSettings = TasSettings
 
-local function _tasApplySavedThemeAccent(cfg)
+function _tasApplySavedThemeAccent(cfg)
     if type(cfg) ~= "table" then return end
     if cfg.ThemePreset and ThemePresets[cfg.ThemePreset] then
         setThemePreset(cfg.ThemePreset)
@@ -1297,7 +1418,7 @@ local function _tasApplySavedThemeAccent(cfg)
     end
 end
 
-local function LoadTasSettings()
+function LoadTasSettings()
     if not isfile(TasSettingsPath) then return {} end
     local ok, raw = pcall(readfile, TasSettingsPath)
     if not ok or type(raw) ~= "string" or raw == "" then return {} end
@@ -1308,7 +1429,7 @@ local function LoadTasSettings()
     return {}
 end
 
-local function SaveTasSettings()
+function SaveTasSettings()
     local cfg = TasSettings or {}
     cfg.Version = 1
     cfg.ThemePreset = cfg.ThemePreset or "Midnight Blue"
@@ -1321,8 +1442,8 @@ local function SaveTasSettings()
     cfg.Window.YScale = MainFrame and MainFrame.Position.Y.Scale or 0.5
     cfg.Window.XOffset = MainFrame and MainFrame.Position.X.Offset or 0
     cfg.Window.YOffset = MainFrame and MainFrame.Position.Y.Offset or 0
-    cfg.Window.Width = MainFrame and MainFrame.Size.X.Offset or 650
-    cfg.Window.Height = MainFrame and MainFrame.Size.Y.Offset or 468
+    cfg.Window.Width = MainFrame and MainFrame.Size.X.Offset or 700
+    cfg.Window.Height = MainFrame and MainFrame.Size.Y.Offset or 500
     cfg.SidePanels = cfg.SidePanels or {}
     cfg.SidePanels.Players = PlayersPanelVisible ~= false
     cfg.SidePanels.Files = FilesPanelVisible ~= false
@@ -1350,7 +1471,7 @@ local function SaveTasSettings()
     if ok then TasSettings = cfg; _G.TasSettings = cfg end
 end
 
-local function QueueSaveTasSettings()
+function QueueSaveTasSettings()
     task.defer(function() pcall(SaveTasSettings) end)
 end
 
@@ -1364,7 +1485,7 @@ _tasApplySavedThemeAccent(TasSettings)
 -- ── Instance helpers ─────────────────────────────────────────────────────────
 
 -- Layered border: BorderSizePixel=2, BorderColor3=border, UIStroke=outline
-local function addLayeredBorder(parent)
+function addLayeredBorder(parent)
     parent.BorderSizePixel = 2
     parent.BorderColor3 = Theme.border
     applyTheme(parent, "BorderColor3", "border")
@@ -1380,7 +1501,7 @@ local function addLayeredBorder(parent)
 end
 
 -- Simple outline stroke (no inner border)
-local function addStroke(parent, themeKey, thickness, transparency)
+function addStroke(parent, themeKey, thickness, transparency)
     local s = mk("UIStroke", {
         Parent = parent,
         Color = Theme[themeKey or "outline"],
@@ -1393,7 +1514,7 @@ local function addStroke(parent, themeKey, thickness, transparency)
 end
 
 -- Text shadow stroke
-local function addTextShadow(parent)
+function addTextShadow(parent)
     return mk("UIStroke", {
         Parent = parent,
         LineJoinMode = Enum.LineJoinMode.Miter,
@@ -1403,7 +1524,7 @@ local function addTextShadow(parent)
 end
 
 -- Accent gradient line
-local function addAccentLine(parent, pos, size)
+function addAccentLine(parent, pos, size)
     local line = mk("Frame", {
         Parent = parent,
         Position = pos or UDim2.new(0, 0, 0, 0),
@@ -1425,7 +1546,7 @@ local function addAccentLine(parent, pos, size)
 end
 
 -- Vertical gradient overlay for buttons / elements
-local function addVertGradient(parent)
+function addVertGradient(parent)
     return mk("UIGradient", {
         Parent = parent,
         Rotation = 90,
@@ -1465,7 +1586,7 @@ local DropdownGui = mk("ScreenGui", {
 
 MainFrame = mk("Frame", {
     Name = "MainFrame",
-    Size = UDim2.fromOffset(650, 468),
+    Size = UDim2.fromOffset(700, 500),
     Position = UDim2.fromScale(0.5, 0.5),
     AnchorPoint = Vector2.new(0.5, 0.5),
     BackgroundColor3 = Theme.bg_window,
@@ -1561,18 +1682,23 @@ local TitleLabel = mk("TextLabel", {
 applyTheme(TitleLabel, "TextColor3", "accent")
 addTextShadow(TitleLabel)
 
--- Version label: reserved space so the title and side buttons never overlap.
-local VersionLabel = mk("TextLabel", {
-    Size = UDim2.fromOffset(74, 28),
-    Position = UDim2.fromOffset(90, 0),
-    BackgroundTransparency = 1,
-    Text = Version,
+-- Version label: styled chip/badge matching the reference screenshot.
+local VersionLabel = mk("TextButton", {
+    Size = UDim2.fromOffset(52, 16),
+    Position = UDim2.new(0, 100, 0.5, -8),
+    BackgroundColor3 = Theme.bg_panel,
+    BorderSizePixel = 2,
+    BorderColor3 = Theme.border,
+    Text = tostring(Version):gsub("%-TAS5$", ""),
     TextColor3 = Theme.txt_muted,
     FontFace = UIFont,
-    TextSize = 10,
-    TextXAlignment = Enum.TextXAlignment.Left,
+    TextSize = 9,
+    AutoButtonColor = false,
     Parent = TitleBar,
 })
+applyTheme(VersionLabel, "BackgroundColor3", "bg_panel")
+applyTheme(VersionLabel, "BorderColor3", "border")
+addStroke(VersionLabel, "outline", 1)
 
 -- Minimize button
 local HideBtn = mk("TextButton", {
@@ -1601,7 +1727,7 @@ local FilesPanel
 PlayersPanelVisible = true
 FilesPanelVisible = true
 
-local function addTitleToggle(parent, text, x)
+function addTitleToggle(parent, text, x)
     local b = mk("TextButton", {
         Size = UDim2.fromOffset(62, 18),
         Position = UDim2.fromOffset(x, 5),
@@ -1629,7 +1755,7 @@ local FilesToggle = addTitleToggle(TitleBar, "FILES", 234)
 -- Reference-style search/status controls in the title bar.
 local SearchBox = mk("TextBox", {
     Size = UDim2.fromOffset(190, 18),
-    Position = UDim2.new(1, -312, 0, 5),
+    Position = UDim2.new(1, -332, 0, 5),
     BackgroundColor3 = Theme.bg_element,
     BorderSizePixel = 2,
     BorderColor3 = Theme.border,
@@ -1646,14 +1772,15 @@ local SearchBox = mk("TextBox", {
 applyTheme(SearchBox, "BackgroundColor3", "bg_element")
 applyTheme(SearchBox, "BorderColor3", "border")
 addStroke(SearchBox, "outline", 1)
+mk("UIPadding", {PaddingLeft = UDim.new(0, 6), Parent = SearchBox})
 
 StatusPill = mk("TextLabel", {
     Size = UDim2.fromOffset(102, 18),
-    Position = UDim2.new(1, -118, 0, 5),
+    Position = UDim2.new(1, -136, 0, 5),
     BackgroundColor3 = Theme.bg_element,
     BorderSizePixel = 2,
     BorderColor3 = Theme.border,
-    Text = "Idle",
+    Text = "■ Idle",
     TextColor3 = Theme.txt_muted,
     FontFace = UIFont,
     TextSize = 9,
@@ -1663,9 +1790,10 @@ StatusPill = mk("TextLabel", {
 applyTheme(StatusPill, "BackgroundColor3", "bg_element")
 applyTheme(StatusPill, "BorderColor3", "border")
 addStroke(StatusPill, "outline", 1)
+mk("UIPadding", {PaddingLeft = UDim.new(0, 6), Parent = StatusPill})
 
 -- Side panel factory: compact, dark, blue-accented windows matching the reference.
-local function makeSidePanel(name, title, side, size)
+function makeSidePanel(name, title, side, size)
     local panel = mk("Frame", {
         Name = name,
         Size = UDim2.fromOffset(size.X, size.Y),
@@ -1673,17 +1801,33 @@ local function makeSidePanel(name, title, side, size)
             and UDim2.new(0, -size.X - 8, 0, 0)
             or UDim2.new(1, 8, 0, 0),
         BackgroundColor3 = Theme.bg_window,
-        BorderSizePixel = 2,
-        BorderColor3 = Theme.border,
+        BorderSizePixel = 0,
         Parent = MainFrame,
     })
     applyTheme(panel, "BackgroundColor3", "bg_window")
-    applyTheme(panel, "BorderColor3", "border")
     addStroke(panel, "outline", 1)
+    local panelAccentBorder = mk("UIStroke", {
+        Parent = panel,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+        LineJoinMode = Enum.LineJoinMode.Miter,
+        Color = Theme.accent,
+        Thickness = 1,
+        Transparency = 0,
+    })
+    applyTheme(panelAccentBorder, "Color", "accent")
+    local panelGlow = mk("UIStroke", {
+        Parent = panel,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+        LineJoinMode = Enum.LineJoinMode.Miter,
+        Color = Theme.accent_glow,
+        Thickness = 3,
+        Transparency = 0.65,
+    })
+    applyTheme(panelGlow, "Color", "accent_glow")
     addAccentLine(panel, UDim2.fromOffset(0,0), UDim2.new(1,0,0,2))
 
     local hdr = mk("Frame", {
-        Size = UDim2.new(1,0,0,28),
+        Size = UDim2.new(1,0,0,34),
         Position = UDim2.fromOffset(0,2),
         BackgroundColor3 = Theme.bg_deep,
         BorderSizePixel = 0,
@@ -1691,9 +1835,9 @@ local function makeSidePanel(name, title, side, size)
     })
     applyTheme(hdr, "BackgroundColor3", "bg_deep")
     local hdrTitle = mk("TextLabel", {
-        Size = UDim2.new(1,-8,1,0), Position = UDim2.fromOffset(6,0),
+        Size = UDim2.new(1,-36,1,0), Position = UDim2.fromOffset(10,0),
         BackgroundTransparency = 1, Text = title:upper(),
-        TextColor3 = Theme.accent, FontFace = UIFontBold, TextSize = 10,
+        TextColor3 = Theme.accent, FontFace = UIFontBold, TextSize = 12,
         TextXAlignment = Enum.TextXAlignment.Left, Parent = hdr,
     })
     applyTheme(hdrTitle, "TextColor3", "accent")
@@ -1704,12 +1848,12 @@ local function makeSidePanel(name, title, side, size)
     })
 
     local closeBtn = mk("TextButton", {
-        Size = UDim2.fromOffset(18, 16),
-        Position = UDim2.new(1, -22, 0.5, -8),
+        Size = UDim2.fromOffset(20, 18),
+        Position = UDim2.new(1, -26, 0.5, -9),
         BackgroundColor3 = Theme.bg_element,
         BorderSizePixel = 2,
         BorderColor3 = Theme.border,
-        Text = "×",
+        Text = "x",
         TextColor3 = Theme.txt_muted,
         FontFace = UIFontBold,
         TextSize = 11,
@@ -1720,10 +1864,17 @@ local function makeSidePanel(name, title, side, size)
     applyTheme(closeBtn, "BorderColor3", "border")
     addStroke(closeBtn, "outline", 1)
 
-    local body = mk("Frame", {
-        Position = UDim2.fromOffset(6,32), Size = UDim2.new(1,-12,1,-38),
-        BackgroundTransparency = 1, BorderSizePixel = 0, Parent = panel,
+    local body = mk("ScrollingFrame", {
+        Position = UDim2.fromOffset(6,38), Size = UDim2.new(1,-12,1,-44),
+        BackgroundTransparency = 1, BorderSizePixel = 0,
+        ScrollBarThickness = 3,
+        ScrollBarImageColor3 = Theme.accent_dim,
+        CanvasSize = UDim2.fromScale(0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        ClipsDescendants = true,
+        Parent = panel,
     })
+    applyTheme(body, "ScrollBarImageColor3", "accent_dim")
 
     closeBtn.MouseEnter:Connect(function()
         tw(closeBtn, {TextColor3 = Theme.accent})
@@ -1744,10 +1895,10 @@ local function makeSidePanel(name, title, side, size)
     return panel, body
 end
 
-FilesPanel, _G_TAS_FilesBody = makeSidePanel("FilesPanel", "File Manager", "left", Vector2.new(364, 362))
+FilesPanel, _G_TAS_FilesBody = makeSidePanel("FilesPanel", "File Manager", "left", Vector2.new(364, 400))
 PlayersPanel, _G_TAS_PlayersBody = makeSidePanel("PlayersPanel", "Player Viewer", "right", Vector2.new(488, 441))
 
-local function clearChildrenExceptLayouts(parent)
+function clearChildrenExceptLayouts(parent)
     for _, child in ipairs(parent:GetChildren()) do
         if not child:IsA("UIListLayout") and not child:IsA("UIPadding") then
             child:Destroy()
@@ -1755,88 +1906,327 @@ local function clearChildrenExceptLayouts(parent)
     end
 end
 
-local function buildFilesPanel()
+function buildFilesPanel()
     clearChildrenExceptLayouts(_G_TAS_FilesBody)
     local body = _G_TAS_FilesBody
 
-    local current = mk("TextLabel", {
-        Size=UDim2.new(1,0,0,28), BackgroundColor3=Theme.bg_deep,
-        BorderSizePixel=2, BorderColor3=Theme.border, Text="Current: "..tostring(ReplayPath),
-        TextColor3=Theme.txt_muted, FontFace=UIFont, TextSize=9,
-        TextXAlignment=Enum.TextXAlignment.Left, TextWrapped=true, Parent=body,
+    -- UIListLayout-based layout so elements stack without hardcoded Y offsets.
+    mk("UIListLayout", {
+        FillDirection = Enum.FillDirection.Vertical,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Padding = UDim.new(0, 8),
+        Parent = body,
     })
-    applyTheme(current,"BackgroundColor3","bg_deep"); applyTheme(current,"BorderColor3","border")
-    addStroke(current,"outline",1)
+    mk("UIPadding", {
+        PaddingTop = UDim.new(0, 8),
+        PaddingBottom = UDim.new(0, 10),
+        PaddingLeft = UDim.new(0, 0),
+        PaddingRight = UDim.new(0, 0),
+        Parent = body,
+    })
+
+    -- Helper: section label matching main-window accent style
+    local function makeSmallLabel(text)
+        local lbl = mk("TextLabel", {
+            Size = UDim2.new(1, 0, 0, 16),
+            BackgroundTransparency = 1,
+            Text = text,
+            TextColor3 = Theme.accent,
+            FontFace = UIFontBold,
+            TextSize = 11,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            Parent = body,
+        })
+        applyTheme(lbl, "TextColor3", "accent")
+        addTextShadow(lbl)
+        return lbl
+    end
+
+    -- Helper: action button matching addButton() style from main window
+    local function makeBtn(parent, label, w, callback)
+        local btn = mk("TextButton", {
+            Size = w or UDim2.new(1, 0, 0, 22),
+            BackgroundColor3 = Theme.bg_element,
+            BorderSizePixel = 2,
+            BorderColor3 = Theme.border,
+            Text = "",
+            AutoButtonColor = false,
+            Parent = parent,
+        })
+        applyTheme(btn, "BackgroundColor3", "bg_element")
+        applyTheme(btn, "BorderColor3", "border")
+        addStroke(btn, "outline", 1)
+        addVertGradient(btn)
+        local lbl = mk("TextLabel", {
+            Size = UDim2.fromScale(1, 1),
+            Position = UDim2.fromOffset(0, -1),
+            BackgroundTransparency = 1,
+            Text = label,
+            TextColor3 = Theme.txt,
+            FontFace = UIFont,
+            TextSize = 11,
+            Parent = btn,
+        })
+        applyTheme(lbl, "TextColor3", "txt")
+        addTextShadow(lbl)
+        btn.MouseButton1Click:Connect(callback or function() end)
+        btn.MouseEnter:Connect(function()
+            tw(btn, {BackgroundColor3 = Theme.bg_hover})
+            tw(lbl, {TextColor3 = Theme.accent})
+        end)
+        btn.MouseLeave:Connect(function()
+            tw(btn, {BackgroundColor3 = Theme.bg_element})
+            tw(lbl, {TextColor3 = Theme.txt})
+        end)
+        return btn
+    end
+
+    -- ── Current file bar ─────────────────────────────────────────────────────
+    local current = mk("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 20),
+        BackgroundColor3 = Theme.bg_deep,
+        BorderSizePixel = 2,
+        BorderColor3 = Theme.border,
+        Text = "Current: " .. tostring(ReplayPath),
+        TextColor3 = Theme.accent,
+        FontFace = UIFont,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Center,
+        TextWrapped = false,
+        ClipsDescendants = true,
+        Parent = body,
+    })
+    applyTheme(current, "BackgroundColor3", "bg_deep")
+    applyTheme(current, "BorderColor3", "border")
+    addStroke(current, "outline", 1)
+    mk("UIPadding", {PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 6), Parent = current})
+
+    -- ── Replay file list ─────────────────────────────────────────────────────
+    makeSmallLabel("REPLAY FILES")
 
     local list = mk("ScrollingFrame", {
-        Position=UDim2.fromOffset(0,34), Size=UDim2.new(1,0,1,-104),
-        BackgroundColor3=Theme.bg_deep, BorderSizePixel=2, BorderColor3=Theme.border,
-        ScrollBarThickness=2, ScrollBarImageColor3=Theme.accent_dim,
-        CanvasSize=UDim2.fromScale(0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y, Parent=body,
+        Size = UDim2.new(1, 0, 0, 155),
+        BackgroundColor3 = Theme.bg_deep,
+        BorderSizePixel = 2,
+        BorderColor3 = Theme.border,
+        ScrollBarThickness = 3,
+        ScrollBarImageColor3 = Theme.accent_dim,
+        CanvasSize = UDim2.fromScale(0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        Parent = body,
     })
-    applyTheme(list,"BackgroundColor3","bg_deep"); applyTheme(list,"BorderColor3","border")
-    addStroke(list,"outline",1)
-    mk("UIListLayout", {FillDirection=Enum.FillDirection.Vertical, SortOrder=Enum.SortOrder.LayoutOrder,
-        Padding=UDim.new(0,1), Parent=list})
+    applyTheme(list, "BackgroundColor3", "bg_deep")
+    applyTheme(list, "BorderColor3", "border")
+    addStroke(list, "outline", 1)
+    mk("UIPadding", {
+        PaddingTop = UDim.new(0, 3), PaddingBottom = UDim.new(0, 3),
+        PaddingLeft = UDim.new(0, 4), PaddingRight = UDim.new(0, 4),
+        Parent = list,
+    })
+    mk("UIListLayout", {
+        FillDirection = Enum.FillDirection.Vertical,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Padding = UDim.new(0, 2),
+        Parent = list,
+    })
 
     local ok, files = pcall(function() return listfiles(FolderPath) end)
     files = ok and files or {}
+    table.sort(files, function(a, b)
+        return tostring(a):lower() < tostring(b):lower()
+    end)
+
+    local replayFileCount = 0
     for _, path in ipairs(files) do
-        local btn = mk("TextButton", {
-            Size=UDim2.new(1,-4,0,20), BackgroundTransparency=1, BorderSizePixel=0,
-            Text="  "..tostring(path):gsub('^.*[\\/]', ''), TextColor3=Theme.txt_muted,
-            FontFace=UIFont, TextSize=9, TextXAlignment=Enum.TextXAlignment.Left,
-            AutoButtonColor=false, Parent=list,
-        })
-        btn.MouseEnter:Connect(function() btn.BackgroundTransparency=0.8; tw(btn,{TextColor3=Theme.accent}) end)
-        btn.MouseLeave:Connect(function() btn.BackgroundTransparency=1; tw(btn,{TextColor3=Theme.txt_muted}) end)
-        btn.MouseButton1Click:Connect(function()
-            ReplayPath = path
-            ReplayNeedsReload = true
-            CurrentFile.Text = "Current File: "..tostring(path):gsub('^.*[\\/]', '')
-        end)
+        local fileName = tostring(path):gsub('^.*[\\/]', '')
+        local lowerName = fileName:lower()
+        if lowerName:sub(-5) == ".json" or lowerName:sub(-4) == ".tas" then
+            replayFileCount += 1
+            local btn = mk("TextButton", {
+                Size = UDim2.new(1, 0, 0, 22),
+                BackgroundColor3 = Theme.bg_inline,
+                BorderSizePixel = 1,
+                BorderColor3 = Theme.outline,
+                Text = "",
+                AutoButtonColor = false,
+                Parent = list,
+            })
+            applyTheme(btn, "BackgroundColor3", "bg_inline")
+            applyTheme(btn, "BorderColor3", "outline")
+            local btnLbl = mk("TextLabel", {
+                Size = UDim2.fromScale(1, 1),
+                Position = UDim2.fromOffset(0, -1),
+                BackgroundTransparency = 1,
+                Text = fileName,
+                TextColor3 = Theme.txt,
+                FontFace = UIFont,
+                TextSize = 11,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                Parent = btn,
+            })
+            applyTheme(btnLbl, "TextColor3", "txt")
+            addTextShadow(btnLbl)
+            mk("UIPadding", {PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 5), Parent = btn})
+            btn.MouseEnter:Connect(function()
+                tw(btn, {BackgroundColor3 = Theme.bg_hover})
+                tw(btnLbl, {TextColor3 = Theme.accent})
+            end)
+            btn.MouseLeave:Connect(function()
+                tw(btn, {BackgroundColor3 = Theme.bg_inline})
+                tw(btnLbl, {TextColor3 = Theme.txt})
+            end)
+            btn.MouseButton1Click:Connect(function()
+                ReplayPath = path
+                ReplayNeedsReload = true
+                CurrentFile.Text = "Current File: " .. fileName
+                current.Text = "Current: " .. tostring(path)
+            end)
+        end
     end
 
-    local actions = mk("Frame", {Position=UDim2.new(0,0,1,-64), Size=UDim2.new(1,0,0,60),
-        BackgroundTransparency=1, Parent=body})
+    if replayFileCount == 0 then
+        local empty = mk("TextLabel", {
+            Size = UDim2.new(1, -6, 0, 22),
+            BackgroundTransparency = 1,
+            Text = "No replay files",
+            TextColor3 = Theme.txt_dim,
+            FontFace = UIFont,
+            TextSize = 11,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            Parent = list,
+        })
+        mk("UIPadding", {PaddingLeft = UDim.new(0, 8), Parent = empty})
+    end
+
+    -- ── Actions ──────────────────────────────────────────────────────────────
+    makeSmallLabel("ACTIONS")
+
+    local actions = mk("Frame", {
+        Size = UDim2.new(1, 0, 0, 22),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Parent = body,
+    })
+    mk("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Padding = UDim.new(0, 4),
+        Parent = actions,
+    })
+
     local cols = {
         {"Load", function()
             if ReplayPath and isfile(ReplayPath) then
                 local ok2, raw = pcall(readfile, ReplayPath)
                 if ok2 and raw then
-                    local decoded = ReplayDecode(raw)
-                    if decoded then ReplayTable = decoded; ReplayNeedsReload = false; LastLoadedPath = ReplayPath end
+                    local decoded, replayFPS = ReplayDecode(raw)
+                    if decoded then
+                        ReplayTable = decoded
+                        ReplaySaveState.Version = ReplaySaveState.Version + 1
+                        ReplaySaveState.Encoded = raw
+                        ReplaySaveState.EncodedVersion = ReplaySaveState.Version
+                        ReplaySourceFPS = math.max(1, tonumber(replayFPS or TASRecordingFPS) or 1)
+                        ActiveReplayFPS = ReplaySourceFPS
+                        ReplayNeedsReload = false
+                        LastLoadedPath = ReplayPath
+                        ConsoleMessage("Loaded: " .. tostring(ReplayPath))
+                    end
                 end
             end
         end},
-        {"Save", function() SaveToFile() end},
-        {"Delete", function()
-            if ReplayPath and isfile(ReplayPath) then pcall(delfile, ReplayPath); ReplayNeedsReload=true end
+        {"Save",    function() SaveToFile() end},
+        {"Delete",  function()
+            if ReplayPath and isfile(ReplayPath) then
+                pcall(delfile, ReplayPath)
+                ReplayNeedsReload = true
+            end
             buildFilesPanel()
         end},
         {"Refresh", function() buildFilesPanel() end},
     }
-    local w = 1/#cols
-    for i, item in ipairs(cols) do
-        local b = mk("TextButton", {Size=UDim2.new(w,-4,0,24), Position=UDim2.new(w*(i-1),2,0,0),
-            BackgroundColor3=Theme.bg_element, BorderSizePixel=2, BorderColor3=Theme.border,
-            Text=item[1], TextColor3=Theme.txt_muted, FontFace=UIFontBold, TextSize=9,
-            AutoButtonColor=false, Parent=actions})
-        applyTheme(b,"BackgroundColor3","bg_element"); applyTheme(b,"BorderColor3","border"); addStroke(b,"outline",1)
-        b.MouseButton1Click:Connect(item[2])
+    for _, item in ipairs(cols) do
+        makeBtn(actions, item[1], UDim2.new(0.25, -3, 0, 22), item[2])
     end
-    local erase = mk("TextButton", {Size=UDim2.new(1,0,0,24), Position=UDim2.fromOffset(0,30),
-        BackgroundColor3=Theme.bg_element, BorderSizePixel=2, BorderColor3=Theme.border,
-        Text="ERASE CURRENT", TextColor3=Theme.txt_muted, FontFace=UIFontBold, TextSize=9,
-        AutoButtonColor=false, Parent=actions})
-    applyTheme(erase,"BackgroundColor3","bg_element"); applyTheme(erase,"BorderColor3","border"); addStroke(erase,"outline",1)
-    erase.MouseButton1Click:Connect(function()
-        ResetCurrentRecording()
-        buildFilesPanel()
-    end)
+
+    -- ── Create new ───────────────────────────────────────────────────────────
+    makeSmallLabel("CREATE NEW")
+
+    local createRow = mk("Frame", {
+        Size = UDim2.new(1, 0, 0, 22),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Parent = body,
+    })
+    mk("UIListLayout", {FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4), Parent = createRow})
+
+    local createBox = mk("TextBox", {
+        Size = UDim2.new(0.78, -2, 0, 22),
+        BackgroundColor3 = Theme.bg_element,
+        BorderSizePixel = 2,
+        BorderColor3 = Theme.border,
+        Text = "",
+        PlaceholderText = "filename (no extension)...",
+        PlaceholderColor3 = Theme.txt_dim,
+        TextColor3 = Theme.txt,
+        FontFace = UIFont,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        ClearTextOnFocus = false,
+        Parent = createRow,
+    })
+    applyTheme(createBox, "BackgroundColor3", "bg_element")
+    applyTheme(createBox, "BorderColor3", "border")
+    local cbStroke = addStroke(createBox, "outline", 1)
+    mk("UIPadding", {PaddingLeft = UDim.new(0, 7), PaddingRight = UDim.new(0, 5), Parent = createBox})
+    createBox.Focused:Connect(function() tw(cbStroke, {Color = Theme.accent, Transparency = 0.3}); tw(createBox, {TextColor3 = Theme.accent}) end)
+    createBox.FocusLost:Connect(function() tw(cbStroke, {Color = Theme.outline, Transparency = 0}); tw(createBox, {TextColor3 = Theme.txt}) end)
+
+    local createBtn = makeBtn(createRow, "Create", UDim2.new(0.22, -2, 0, 22))
+
+    local function createReplayFile()
+        local name = tostring(createBox.Text or "")
+        name = name:gsub("^%s+", ""):gsub("%s+$", "")
+        if name == "" then ConsoleMessage("Enter a file name"); return end
+        name = name:gsub('[\\/:*?"<>|]', "_")
+        if not name:lower():match("%.json$") then name = name .. ".json" end
+        if not isfolder(FolderPath) then pcall(makefolder, FolderPath) end
+        local path = FolderPath .. "\\" .. name
+        if isfile(path) then ConsoleMessage("File already exists: " .. name); return end
+        local emptyReplay = '{"Format":"TASABILITY_JSON3","Version":3,"FPS":' .. tostring(math.max(1, tonumber(TASRecordingFPS) or 1)) .. ',"Compression":"TAS4","Binary":"base64","RawBytes":0,"PackedBytes":0,"Frames":0,"Data":""}'
+        local okWrite, err = pcall(writefile, path, emptyReplay)
+        if okWrite then
+            ReplayPath = path
+            ReplayNeedsReload = true
+            LastLoadedPath = nil
+            CurrentFile.Text = "Current File: " .. name
+            current.Text = "Current: " .. path
+            createBox.Text = ""
+            buildFilesPanel()
+            ConsoleMessage("Created: " .. path)
+        else
+            ConsoleMessage("Create failed: " .. tostring(err))
+        end
+    end
+    createBtn.MouseButton1Click:Connect(createReplayFile)
+    createBox.FocusLost:Connect(function(enterPressed) if enterPressed then createReplayFile() end end)
+
+    -- ── Extra ─────────────────────────────────────────────────────────────────
+    makeSmallLabel("EXTRA")
+
+    local extra = mk("Frame", {
+        Size = UDim2.new(1, 0, 0, 22),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Parent = body,
+    })
+    mk("UIListLayout", {FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4), Parent = extra})
+
+    makeBtn(extra, "Copy Path",     UDim2.new(0.5, -2, 0, 22), function() if setclipboard then setclipboard(tostring(ReplayPath)) end end)
+    makeBtn(extra, "Erase Current", UDim2.new(0.5, -2, 0, 22), function() ResetCurrentRecording(); buildFilesPanel() end)
 end
 
-local function buildPlayersPanel()
+function buildPlayersPanel()
     clearChildrenExceptLayouts(_G_TAS_PlayersBody)
     local body = _G_TAS_PlayersBody
 
@@ -1981,7 +2371,20 @@ pcall(function()
     local w = TasSettings.Window
     if type(w) == "table" and MainFrame then
         MainFrame.Position = UDim2.new(tonumber(w.XScale) or 0.5, tonumber(w.XOffset) or 0, tonumber(w.YScale) or 0.5, tonumber(w.YOffset) or 0)
-        MainFrame.Size = UDim2.fromOffset(tonumber(w.Width) or 650, tonumber(w.Height) or 468)
+        local savedWidth = tonumber(w.Width)
+        local savedHeight = tonumber(w.Height)
+        -- Standard window size is 700x500. Migrate old defaults so an older
+        -- saved config cannot silently restore the previous main-window size.
+        local oldDefault = (savedWidth == 1180 and savedHeight == 760)
+            or (savedWidth == 650 and savedHeight == 468)
+        if savedWidth and savedHeight and not oldDefault and savedWidth >= 400 and savedHeight >= 300 then
+            MainFrame.Size = UDim2.fromOffset(savedWidth, savedHeight)
+        else
+            MainFrame.Size = UDim2.fromOffset(700, 500)
+            TasSettings.Window = TasSettings.Window or {}
+            TasSettings.Window.Width = 700
+            TasSettings.Window.Height = 500
+        end
     end
     if type(TasSettings.SidePanels) == "table" then
         PlayersPanelVisible = TasSettings.SidePanels.Players ~= false
@@ -2038,25 +2441,27 @@ local tabButtons = {}  -- stores the button Instances
 local tabData = {}     -- stores {textLbl, hideBar} per tab name (separate from Instance)
 local activeTab = nil
 
-local function switchTab(name)
+function switchTab(name)
     for n, pg in pairs(tabPages) do pg.Visible = (n == name) end
-    for n, _ in pairs(tabButtons) do
+    for n, btn in pairs(tabButtons) do
         local data = tabData[n]
         if not data then continue end
         if n == name then
             data.textLbl.TextColor3 = Theme.accent
             data.textLbl.TextTransparency = 0
             data.hideBar.Visible = true
+            btn.BackgroundColor3 = Theme.bg_inline
         else
             data.textLbl.TextColor3 = Theme.txt
             data.textLbl.TextTransparency = 0.48
             data.hideBar.Visible = false
+            btn.BackgroundColor3 = Theme.bg_panel
         end
     end
     activeTab = name
 end
 
-local function addTab(label)
+function addTab(label)
     local btn = mk("TextButton", {
         Size = UDim2.new(0, 90, 1, 0),
         BackgroundColor3 = Theme.bg_panel,
@@ -2084,27 +2489,33 @@ local function addTab(label)
     })
     addTextShadow(textLbl)
 
-    -- "Hide bar" that covers bottom border when active 
+    -- Accent underline shown at the bottom of the active tab (matches the reference screenshot).
     local hideBar = mk("Frame", {
-        Size = UDim2.new(1, 0, 0, 3),
-        Position = UDim2.new(0, 0, 1, 0),
+        Size = UDim2.new(1, 0, 0, 2),
+        Position = UDim2.new(0, 0, 1, -2),
         AnchorPoint = Vector2.new(0, 1),
-        BackgroundColor3 = Theme.bg_deep,
+        BackgroundColor3 = Theme.accent,
         BorderSizePixel = 0,
         Visible = false,
-        ZIndex = 2,
+        ZIndex = 4,
         Parent = btn,
     })
-    applyTheme(hideBar, "BackgroundColor3", "bg_deep")
+    applyTheme(hideBar, "BackgroundColor3", "accent")
 
     -- Store data in a plain Lua table, NOT on the Instance
     tabData[label] = {textLbl = textLbl, hideBar = hideBar}
 
     btn.MouseEnter:Connect(function()
-        if activeTab ~= label then tw(textLbl, {TextColor3 = Theme.accent_glow}) end
+        if activeTab ~= label then
+            tw(textLbl, {TextColor3 = Theme.accent_glow})
+            tw(btn, {BackgroundColor3 = Theme.bg_hover})
+        end
     end)
     btn.MouseLeave:Connect(function()
-        if activeTab ~= label then tw(textLbl, {TextColor3 = Theme.txt}) end
+        if activeTab ~= label then
+            tw(textLbl, {TextColor3 = Theme.txt})
+            tw(btn, {BackgroundColor3 = Theme.bg_panel})
+        end
     end)
 
     -- Page
@@ -2134,7 +2545,7 @@ end
 --  SECTION BUILDER 
 -- ══════════════════════════════════════════════════════════════════════════════
 
-local function addSection(page, title)
+function addSection(page, title)
     local wrap = mk("Frame", {
         Size = UDim2.new(1, 0, 0, 0),
         AutomaticSize = Enum.AutomaticSize.Y,
@@ -2185,7 +2596,7 @@ end
 -- ══════════════════════════════════════════════════════════════════════════════
 
 -- addLabel ─────────────────────────────────────────────
-local function addLabel(parent, defaultText)
+function addLabel(parent, defaultText)
     local lbl = mk("TextLabel", {
         Size = UDim2.new(1, 0, 0, 14),
         BackgroundTransparency = 1,
@@ -2212,7 +2623,7 @@ local function addLabel(parent, defaultText)
 end
 
 -- addButton ────────────────────────────────────────────
-local function addButton(parent, label, callback)
+function addButton(parent, label, callback)
     local btn = mk("TextButton", {
         Size = UDim2.new(1, 0, 0, 22),
         BackgroundColor3 = Theme.bg_element,
@@ -2258,7 +2669,7 @@ local function addButton(parent, label, callback)
 end
 
 -- addRow ───────────────────────────────────────────────
-local function addRow(parent)
+function addRow(parent)
     local row = mk("Frame", {
         Size = UDim2.new(1, 0, 0, 22),
         BackgroundTransparency = 1,
@@ -2370,7 +2781,7 @@ function addKeybind(parent, cfg, size)
 end
 
 -- addCheckbox ─────────────────────────────────────────
-local function addCheckbox(parent, cfg)
+function addCheckbox(parent, cfg)
     local enabled = cfg.Default or false
 
     local row = mk("TextButton", {
@@ -2420,7 +2831,7 @@ local function addCheckbox(parent, cfg)
 end
 
 -- addTextbox ──────────────────────────────────────────
-local function addTextbox(parent, cfg)
+function addTextbox(parent, cfg)
     local wrap = mk("Frame", {
         Size=UDim2.new(1,0,0,22), BackgroundTransparency=1, BorderSizePixel=0, Parent=parent,
     })
@@ -2463,7 +2874,7 @@ local function addTextbox(parent, cfg)
 end
 
 -- addCombo (dropdown) ─────────────────────────────────
-local function addCombo(parent, cfg)
+function addCombo(parent, cfg)
     local selected = ""
     local open = false
 
@@ -2560,7 +2971,7 @@ local function addCombo(parent, cfg)
 end
 
 -- makeConsole ─────────────────────────────────────────
-local function makeConsole(parent)
+function makeConsole(parent)
     local frame = mk("Frame", {
         Size=UDim2.fromScale(1,1), BackgroundColor3=Theme.bg_deep, BorderSizePixel=0, Parent=parent,
     })
@@ -2653,7 +3064,7 @@ local function makeConsole(parent)
 end
 
 -- makePopup ───────────────────────────────────────────
-local function makePopup(title)
+function makePopup(title)
     local overlay = mk("Frame", {
         Size=UDim2.fromScale(1,1), BackgroundColor3=Color3.new(0,0,0),
         BackgroundTransparency=0.5, BorderSizePixel=0, ZIndex=9000, Parent=RootGui,
@@ -2714,352 +3125,345 @@ physicsPage  = addTab("physics")
 visualsPage  = addTab("visuals")
 consolePage  = addTab("console")
 settingsPage = addTab("settings")
-switchTab("controls")
 
--- ── INFO SECTION ─────────────────────────────────────────────────────────────
-infoSec = addSection(controlsPage, "info")
-
-RecordedFramesLabel    = addLabel(infoSec, "Frames: 0")
-PressedKeysLabel       = addLabel(infoSec, "Pressed keys: |")
-WritingPressedKeysLabel = addLabel(infoSec, "Writing Pressed keys: |")
-
--- ColorCodeFrame
--- Use the actual TextLabel directly. The previous metatable proxy captured the
--- Instance inside __newindex/__index and could fail on later callback threads
--- with: "current thread cannot access 'Instance' (lacking capability Plugin)".
+-- Controls page is a two-column dashboard rather than one long stack.
+-- This keeps the main window close to the reference layout while preserving
+-- the existing element builders and callbacks.
 do
-    local _cfLbl = mk("TextLabel", {
-        Size=UDim2.new(1,0,0,14), BackgroundTransparency=1,
-        Text="Status: Idle", TextColor3=Theme.txt,
-        FontFace=UIFontBold, TextSize=11, TextXAlignment=Enum.TextXAlignment.Left,
-        Parent=infoSec,
-    })
-    addTextShadow(_cfLbl)
-    ColorCodeFrame = _cfLbl
-end
-
-ConnectedLabel = addLabel(infoSec, "AHK folder not found")
-
-do
-    local _cpBtn = addButton(infoSec, "Place id: "..tostring(PlaceId), function()
-        if setclipboard then setclipboard(tostring(PlaceId)) end
-    end)
-    CurrentPlaceIdButton = _cpBtn
-end
-
-_currentFileLbl = addLabel(infoSec, "Current File: ")
-CurrentFile = _currentFileLbl
-
--- ── CONTROLS SECTION ─────────────────────────────────────────────────────────
-ctrlSec = addSection(controlsPage, "controls")
-
--- Frozen → Idle row
-FrozenRow = addRow(ctrlSec)
-FrozenRow:Button({Text = "Frozen → Idle", Callback = function() IdleButton_MouseButton1Click() end})
-Frozenkeybind = FrozenRow:Keybind({Label = "keybind", Value = Enum.KeyCode.M})
-
--- Pause keybind
-Pausekeybind = addKeybind(ctrlSec, {Label = "Pause / Resume", Value = Enum.KeyCode.R})
-
--- Ignore game processed
-IgnoreGameProcessedButton = addCheckbox(ctrlSec, {
-    Label = "Ignore Game Processed", Default = false,
-    Callback = function() IgnoreGameProcessed = not IgnoreGameProcessed end,
-})
-
--- Keyboard overlay themes
-KeyboardOverlayThemes = {
-    ["Default"] = {
-        create = function(container)
-            local function createKey(name, position, size, displayText)
-                local key = Instance.new("TextLabel")
-                key.Name=name; key.Size=size; key.Position=position
-                key.BackgroundColor3=Color3.fromRGB(35,35,42); key.BorderSizePixel=0
-                key.Text=displayText or name; key.TextColor3=Color3.fromRGB(220,220,230)
-                key.TextSize=(size.X.Offset>70) and 14 or 18; key.Font=Enum.Font.GothamBold
-                key.Parent=container
-                Instance.new("UICorner",key).CornerRadius=UDim.new(0,6)
-                local stroke=Instance.new("UIStroke",key)
-                stroke.Color=Color3.fromRGB(60,60,70); stroke.Thickness=2; stroke.Transparency=0.5
-                return key
-            end
-            local ks = UDim2.fromOffset(45,45)
-            local W=createKey("W",UDim2.fromOffset(120,10),ks)
-            local A=createKey("A",UDim2.fromOffset(65,65),ks)
-            local S=createKey("S",UDim2.fromOffset(120,65),ks)
-            local D=createKey("D",UDim2.fromOffset(175,65),ks)
-            local CL=createKey("CapsLock",UDim2.fromOffset(5,65),UDim2.fromOffset(50,45),"CAPS"); CL.TextSize=12
-            local SH=createKey("LeftShift",UDim2.fromOffset(5,120),UDim2.fromOffset(50,45),"SHIFT"); SH.TextSize=12
-            local SL=createKey("Slash",UDim2.fromOffset(175,10),UDim2.fromOffset(45,45),"/")
-            local SP=createKey("Space",UDim2.fromOffset(65,120),UDim2.fromOffset(210,45),""); SP.TextSize=14
-            return {W=W,A=A,S=S,D=D,LeftShift=SH,RightShift=SH,Space=SP,CapsLock=CL,Slash=SL}
-        end,
-        size = UDim2.fromOffset(320,200),
-        updateColors = function(keyFrame, state)
-            if state == "writing" then
-                keyFrame.BackgroundColor3 = Color3.fromRGB(200,180,80)
-            elseif state == "pressed" then
-                keyFrame.BackgroundColor3 = Color3.fromRGB(80,200,120)
-            else
-                keyFrame.BackgroundColor3 = Color3.fromRGB(35,35,42)
-            end
+    local cleanup = controlsPage:GetChildren()
+    for _, child in ipairs(cleanup) do
+        if child:IsA("UIListLayout") or child:IsA("UIPadding") then
+            child:Destroy()
         end
-    },
-}
-currentTheme = (TasSettings and TasSettings.KeyboardTheme) or "Default"
-
-KeyboardOverlay = addCheckbox(ctrlSec, {
-    Label = "Keyboard Overlay", Default = false,
-    Callback = function(self)
-        local enabled = self.Value
-        if enabled then
-            getgenv().KeyboardOverlayEnabled = true
-            if not getgenv().KeyboardOverlayGui then
-                local overlayGui = Instance.new("ScreenGui")
-                overlayGui.Name="KeyboardOverlay"; overlayGui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
-                overlayGui.ResetOnSpawn=false; overlayGui.DisplayOrder=9999; overlayGui.Parent=Player.PlayerGui
-                local container = Instance.new("Frame")
-                container.Name="Container"; container.Size=KeyboardOverlayThemes[currentTheme].size
-                container.Position=UDim2.new(0,20,1,-container.Size.Y.Offset-20)
-                container.BackgroundTransparency=1; container.BorderSizePixel=0; container.Parent=overlayGui
-                local keys = KeyboardOverlayThemes[currentTheme].create(container)
-                getgenv().KeyboardOverlayGui = overlayGui
-                getgenv().KeyboardOverlayContainer = container
-                getgenv().KeyboardOverlayKeys = keys
-            else getgenv().KeyboardOverlayGui.Enabled = true end
-        else
-            getgenv().KeyboardOverlayEnabled = false
-            if getgenv().KeyboardOverlayGui then getgenv().KeyboardOverlayGui.Enabled = false end
-        end
-    end,
-})
-
-KeyboardThemeCombo = addCombo(ctrlSec, {
-    Text = "Overlay Theme", Placeholder = "Default",
-    GetItems = function() return {"Default"} end,
-    Callback = function(_, sel)
-        if sel and KeyboardOverlayThemes[sel] then
-            currentTheme = sel; TasSettings.KeyboardTheme = sel; QueueSaveTasSettings(); ConsoleMessage("Keyboard theme changed to: "..sel)
-        end
-    end,
-})
-
-DisableParticles = addCheckbox(ctrlSec, {
-    Label = "Disable Particle Emitters", Default = false,
-    Callback = function(self)
-        for _, obj in pairs(workspace:GetDescendants()) do
-            if obj:IsA("ParticleEmitter") then obj.Enabled = not self.Value end
-        end
-    end,
-})
-
-DisableLighting = addCheckbox(ctrlSec, {
-    Label = "Disable Lighting Effects", Default = false,
-    Callback = function(self)
-        local Lighting = game:GetService("Lighting")
-        if self.Value then
-            if not getgenv().OriginalLightingSettings then
-                getgenv().OriginalLightingSettings = {
-                    Ambient=Lighting.Ambient, Brightness=Lighting.Brightness,
-                    GlobalShadows=Lighting.GlobalShadows, ClockTime=Lighting.ClockTime,
-                }
-            end
-            Lighting.Ambient=Color3.fromRGB(255,255,255); Lighting.Brightness=2
-            Lighting.GlobalShadows=false; Lighting.ClockTime=14
-            for _, obj in pairs(Lighting:GetChildren()) do
-                if obj:IsA("BloomEffect") or obj:IsA("BlurEffect") or obj:IsA("ColorCorrectionEffect")
-                    or obj:IsA("SunRaysEffect") or obj:IsA("DepthOfFieldEffect") then
-                    obj.Enabled = false
-                end
-            end
-        else
-            if getgenv().OriginalLightingSettings then
-                for k, v in pairs(getgenv().OriginalLightingSettings) do Lighting[k] = v end
-            end
-            for _, obj in pairs(Lighting:GetChildren()) do
-                if obj:IsA("BloomEffect") or obj:IsA("BlurEffect") or obj:IsA("ColorCorrectionEffect")
-                    or obj:IsA("SunRaysEffect") or obj:IsA("DepthOfFieldEffect") then
-                    obj.Enabled = true
-                end
-            end
-        end
-    end,
-})
-
-MotionBlurToggle = addCheckbox(ctrlSec, {
-    Label = "Motion Blur", Default = false,
-    Callback = function(self)
-        local Lighting = game:GetService("Lighting")
-        if self.Value then
-            if not Lighting:FindFirstChild("TasabilityMotionBlur") then
-                local blur = Instance.new("BlurEffect"); blur.Name="TasabilityMotionBlur"; blur.Size=3; blur.Parent=Lighting
-            end
-        else
-            local blur = Lighting:FindFirstChild("TasabilityMotionBlur")
-            if blur then blur:Destroy() end
-        end
-    end,
-})
-
-movecameraonfroze = addCheckbox(ctrlSec, {Label = "Move camera while frozen", Default = false})
-
--- Read row
-ReadRow = addRow(ctrlSec)
-ReadRow:Button({Text = "Read", Callback = function() ReadButton_MouseButton1Click() end})
-Readkeybind = ReadRow:Keybind({Label = "keybind", Value = Enum.KeyCode.Z})
-
--- Abort row
-AbortRow = addRow(ctrlSec)
-AbortRow:Button({Text = "Abort", Callback = function() StopReading(true) end})
-Abortkeybind = AbortRow:Keybind({Label = "keybind", Value = Enum.KeyCode.L})
-
-Hideuikeybind              = addKeybind(ctrlSec, {Label = "Hide UI",                  Value = Enum.KeyCode.U})
-Recordkeybind              = addKeybind(ctrlSec, {Label = "Record / Freeze",           Value = Enum.KeyCode.E})
-Goforwardkeybind           = addKeybind(ctrlSec, {Label = "Go forward",               Value = Enum.KeyCode.T})
-Gobackwardskeybind         = addKeybind(ctrlSec, {Label = "Go backwards",             Value = Enum.KeyCode.Q})
-Frameadvanceforwardkeybind = addKeybind(ctrlSec, {Label = "Frame advance forward",    Value = Enum.KeyCode.G})
-Frameadvancebackwardskeybind = addKeybind(ctrlSec, {Label = "Frame advance backward", Value = Enum.KeyCode.F})
-Savekeybind                = addKeybind(ctrlSec, {Label = "Save to file",             Value = Enum.KeyCode.P})
-
--- Rejoin
-addButton(ctrlSec, "Rejoin", function()
-    ConsoleMessage("Rejoining...")
-    SaveToFile()
-    SaveTasSettings()
-    task.wait(0.5)
-    if #game.Players:GetPlayers() <= 1 then
-        game.Players.LocalPlayer:Kick("\nRejoining...")
-        task.wait()
-        game:GetService("TeleportService"):Teleport(game.PlaceId, game.Players.LocalPlayer)
-    else
-        game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId, game.JobId, game.Players.LocalPlayer)
     end
-end)
 
-addButton(ctrlSec, "Erase Recording", function()
-    ResetCurrentRecording()
-end)
+    controlsPage.CanvasSize = UDim2.new(0, 0, 0, 0)
+    controlsPage.AutomaticCanvasSize = Enum.AutomaticSize.None
+    controlsPage.ScrollBarThickness = 0
 
--- FPS textbox
-FPSTextbox = addTextbox(ctrlSec, {
-    Label = "FPS Cap", Value = tostring(FPS), Placeholder = "Enter FPS...",
-    Callback = function(_, value)
-        local newFPS = tonumber(value)
-        if newFPS and newFPS > 0 and newFPS <= 1000 then
-            FPS = newFPS
-            if setfpscap then
-                setfpscap(FPS)
-            end
-            TasSettings.FPS = FPS; QueueSaveTasSettings(); ConsoleMessage("FPS set to "..tostring(FPS))
-        end
-    end,
-})
+    local dashboard = mk("Frame", {
+        Size = UDim2.new(1, -4, 1, -4),
+        Position = UDim2.fromOffset(2, 2),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Parent = controlsPage,
+    })
 
-TASRecordingFPSTextbox = addTextbox(ctrlSec, {
-    Label = "TAS Recording FPS", Value = tostring(TASRecordingFPS), Placeholder = "Enter recording FPS...",
-    Callback = function(_, value)
-        local newFPS = tonumber(value)
-        if newFPS and newFPS > 0 and newFPS <= 1000 then
-            TASRecordingFPS = newFPS
-            TasSettings.TASRecordingFPS = TASRecordingFPS; QueueSaveTasSettings(); ConsoleMessage("TAS Recording FPS set to "..tostring(TASRecordingFPS).." (actual sampling rate)")
-        end
-    end,
-})
+    local leftColumn = mk("Frame", {
+        Size = UDim2.new(0.5, -5, 1, 0),
+        Position = UDim2.fromOffset(0, 0),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Parent = dashboard,
+    })
+    mk("UIListLayout", {
+        FillDirection = Enum.FillDirection.Vertical,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Padding = UDim.new(0, 7),
+        Parent = leftColumn,
+    })
 
--- Teleport
-TeleportTextbox = addTextbox(ctrlSec, {Label = "Teleport PlaceId", Placeholder = "Enter PlaceId..."})
-addButton(ctrlSec, "Teleport", function()
-    local placeId = tonumber(TeleportTextbox.Value)
-    if placeId and placeId > 0 then
-        ConsoleMessage("Teleporting to: "..tostring(placeId))
-        SaveToFile(); task.wait(0.5)
-        pcall(function() game:GetService("TeleportService"):Teleport(placeId, game.Players.LocalPlayer) end)
-    else ConsoleMessage("Invalid PlaceId") end
-end)
+    local rightColumn = mk("Frame", {
+        Size = UDim2.new(0.5, -5, 1, 0),
+        Position = UDim2.new(0.5, 5, 0, 0),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Parent = dashboard,
+    })
+    mk("UIListLayout", {
+        FillDirection = Enum.FillDirection.Vertical,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Padding = UDim.new(0, 7),
+        Parent = rightColumn,
+    })
 
--- ── FILE MANAGEMENT SECTION ──────────────────────────────────────────────────
-fileSec = addSection(controlsPage, "file management")
+    -- ── INFO ───────────────────────────────────────────────────────────────────
+    infoSec = addSection(leftColumn, "info")
+    RecordedFramesLabel     = addLabel(infoSec, "Frames: 0")
+    PressedKeysLabel        = addLabel(infoSec, "Pressed keys: |")
+    WritingPressedKeysLabel = addLabel(infoSec, "Writing Pressed keys: |")
 
-addButton(fileSec, "Save to File", function() SaveToFile() end)
+    do
+        local _cfLbl = mk("TextLabel", {
+            Size=UDim2.new(1,0,0,14), BackgroundTransparency=1,
+            Text="Status: Idle", TextColor3=Theme.txt,
+            FontFace=UIFontBold, TextSize=11, TextXAlignment=Enum.TextXAlignment.Left,
+            Parent=infoSec,
+        })
+        addTextShadow(_cfLbl)
+        ColorCodeFrame = _cfLbl
+    end
 
-addButton(fileSec, "Create File", function()
-    local popup = makePopup("Create file")
-    popup:Textbox({Text = "File name", Placeholder = "name...", Callback = function(_, name)
-        if #name > 0 then
-            writefile(FolderPath.."./"..name..".json", "")
-            ReplayTable = {}
-            ReplaySaveState.Version = ReplaySaveState.Version + 1
-            ReplaySaveState.Encoded = nil
-            ReplaySaveState.EncodedVersion = -1
-            ReplayPath = FolderPath.."./"..name..".json"
-        end
-    end})
-    popup:Button({Text = "Done", Callback = function() popup:ClosePopup() end})
-end)
+    ConnectedLabel = addLabel(infoSec, "AHK folder not found")
 
-addButton(fileSec, "Load File", function()
-    local popup = makePopup("Load file")
-    popup:Combo({Text = "Select file", Placeholder = "select...",
-        GetItems = function() return listfiles(FolderPath) end,
-        Callback = function(_, path)
-            if not path then return end
-            ConsoleMessage("Loading: "..path)
-            ReplayPath = path
-            if path ~= LastLoadedPath or ReplayNeedsReload then
-                local fc = readfile(path)
-                if #fc > #ReplayFileBeginning then
-                    ReplayTable = ReplayDecode(fc)
-                    ReplaySaveState.Version = ReplaySaveState.Version + 1
-                    ReplaySaveState.Encoded = (type(fc) == "string" and fc ~= "") and fc or nil
-                    ReplaySaveState.EncodedVersion = ReplaySaveState.Encoded and ReplaySaveState.Version or -1
-                    ReplayNeedsReload = false; LastLoadedPath = path
-                    ConsoleMessage("Decoded and cached replay")
-                else
-                    ReplayTable = {}
-                    ReplaySaveState.Version = ReplaySaveState.Version + 1
-                    ReplaySaveState.Encoded = nil
-                    ReplaySaveState.EncodedVersion = -1
-                    ReplayNeedsReload = false; LastLoadedPath = path
-                    ConsoleMessage("File is empty")
+    do
+        local _cpBtn = addButton(infoSec, "Place id: "..tostring(PlaceId), function()
+            if setclipboard then setclipboard(tostring(PlaceId)) end
+        end)
+        CurrentPlaceIdButton = _cpBtn
+    end
+
+    _currentFileLbl = addLabel(infoSec, "Current File: ")
+    CurrentFile = _currentFileLbl
+
+    -- ── CONTROLS ───────────────────────────────────────────────────────────────
+    ctrlSec = addSection(leftColumn, "controls")
+
+    FrozenRow = addRow(ctrlSec)
+    FrozenRow:Button({Text = "Frozen → Idle", Callback = function() IdleButton_MouseButton1Click() end})
+    Frozenkeybind = FrozenRow:Keybind({Label = "keybind", Value = Enum.KeyCode.M})
+
+    Pausekeybind = addKeybind(ctrlSec, {Label = "Pause / Resume", Value = Enum.KeyCode.R})
+
+    IgnoreGameProcessedButton = addCheckbox(ctrlSec, {
+        Label = "Ignore Game Processed", Default = false,
+        Callback = function(self) IgnoreGameProcessed = self.Value end,
+    })
+
+    KeyboardOverlayThemes = {
+        ["Default"] = {
+            create = function(container)
+                local function createKey(name, position, size, displayText)
+                    local key = Instance.new("TextLabel")
+                    key.Name=name; key.Size=size; key.Position=position
+                    key.BackgroundColor3=Color3.fromRGB(35,35,42); key.BorderSizePixel=0
+                    key.Text=displayText or name; key.TextColor3=Color3.fromRGB(220,220,230)
+                    key.TextSize=(size.X.Offset>70) and 14 or 18; key.Font=Enum.Font.GothamBold
+                    key.Parent=container
+                    Instance.new("UICorner",key).CornerRadius=UDim.new(0,6)
+                    local stroke=Instance.new("UIStroke",key)
+                    stroke.Color=Color3.fromRGB(60,60,70); stroke.Thickness=2; stroke.Transparency=0.5
+                    return key
                 end
-            else ConsoleMessage("Using cached replay") end
+                local ks = UDim2.fromOffset(45,45)
+                local W=createKey("W",UDim2.fromOffset(120,10),ks)
+                local A=createKey("A",UDim2.fromOffset(65,65),ks)
+                local S=createKey("S",UDim2.fromOffset(120,65),ks)
+                local D=createKey("D",UDim2.fromOffset(175,65),ks)
+                local CL=createKey("CapsLock",UDim2.fromOffset(5,65),UDim2.fromOffset(50,45),"CAPS"); CL.TextSize=12
+                local SH=createKey("LeftShift",UDim2.fromOffset(5,120),UDim2.fromOffset(50,45),"SHIFT"); SH.TextSize=12
+                local SL=createKey("Slash",UDim2.fromOffset(175,10),UDim2.fromOffset(45,45),"/")
+                local SP=createKey("Space",UDim2.fromOffset(65,120),UDim2.fromOffset(210,45),""); SP.TextSize=14
+                return {W=W,A=A,S=S,D=D,LeftShift=SH,RightShift=SH,Space=SP,CapsLock=CL,Slash=SL}
+            end,
+            size = UDim2.fromOffset(320,200),
+            updateColors = function(keyFrame, state)
+                if state == "writing" then
+                    keyFrame.BackgroundColor3 = Color3.fromRGB(200,180,80)
+                elseif state == "pressed" then
+                    keyFrame.BackgroundColor3 = Color3.fromRGB(80,200,120)
+                else
+                    keyFrame.BackgroundColor3 = Color3.fromRGB(35,35,42)
+                end
+            end
+        },
+    }
+    currentTheme = (TasSettings and TasSettings.KeyboardTheme) or "Default"
+
+    KeyboardOverlay = addCheckbox(ctrlSec, {
+        Label = "Keyboard Overlay", Default = false,
+        Callback = function(self)
+            local enabled = self.Value
+            if enabled then
+                getgenv().KeyboardOverlayEnabled = true
+                if not getgenv().KeyboardOverlayGui then
+                    local overlayGui = Instance.new("ScreenGui")
+                    overlayGui.Name="KeyboardOverlay"; overlayGui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+                    overlayGui.ResetOnSpawn=false; overlayGui.DisplayOrder=9999; overlayGui.Parent=Player.PlayerGui
+                    local container = Instance.new("Frame")
+                    container.Name="Container"; container.Size=KeyboardOverlayThemes[currentTheme].size
+                    container.Position=UDim2.new(0,20,1,-container.Size.Y.Offset-20)
+                    container.BackgroundTransparency=1; container.BorderSizePixel=0; container.Parent=overlayGui
+                    local keys = KeyboardOverlayThemes[currentTheme].create(container)
+                    getgenv().KeyboardOverlayGui = overlayGui
+                    getgenv().KeyboardOverlayContainer = container
+                    getgenv().KeyboardOverlayKeys = keys
+                else
+                    getgenv().KeyboardOverlayGui.Enabled = true
+                end
+            else
+                getgenv().KeyboardOverlayEnabled = false
+                if getgenv().KeyboardOverlayGui then getgenv().KeyboardOverlayGui.Enabled = false end
+            end
         end,
     })
-    popup:Button({Text = "Done", Callback = function() popup:ClosePopup() end})
-end)
 
-addButton(fileSec, "Delete File", function()
-    local popup = makePopup("Delete file")
-    local filePick = popup:Combo({Text = "Select file", Placeholder = "select...",
-        GetItems = function() return listfiles(FolderPath) end,
+    KeyboardThemeCombo = addCombo(ctrlSec, {
+        Text = "Overlay Theme", Placeholder = "Default",
+        GetItems = function() return {"Default"} end,
+        Callback = function(_, sel)
+            if sel and KeyboardOverlayThemes[sel] then
+                currentTheme = sel
+                TasSettings.KeyboardTheme = sel
+                QueueSaveTasSettings()
+                ConsoleMessage("Keyboard theme changed to: "..sel)
+            end
+        end,
     })
-    popup:Button({Text = "Delete", Callback = function()
-        popup:ClosePopup()
-        if filePick.Value and #filePick.Value > 0 then delfile(filePick.Value) end
-    end})
-end)
 
--- ── PHYSICS SECTION ──────────────────────────────────────────────────────────
+    movecameraonfroze = addCheckbox(ctrlSec, {Label = "Move camera while frozen", Default = false})
+
+    ReadRow = addRow(ctrlSec)
+    ReadRow:Button({Text = "Read", Callback = function() ReadButton_MouseButton1Click() end})
+    Readkeybind = ReadRow:Keybind({Label = "keybind", Value = Enum.KeyCode.Z})
+
+    AbortRow = addRow(ctrlSec)
+    AbortRow:Button({Text = "Abort", Callback = function() StopReading(true) end})
+    Abortkeybind = AbortRow:Keybind({Label = "keybind", Value = Enum.KeyCode.L})
+
+    -- ── KEYBINDS ───────────────────────────────────────────────────────────────
+    keybindSec = addSection(rightColumn, "keybinds")
+    Hideuikeybind               = addKeybind(keybindSec, {Label = "Hide UI",                  Value = Enum.KeyCode.U})
+    Recordkeybind               = addKeybind(keybindSec, {Label = "Record / Freeze",          Value = Enum.KeyCode.E})
+    Goforwardkeybind            = addKeybind(keybindSec, {Label = "Go forward",               Value = Enum.KeyCode.T})
+    Gobackwardskeybind          = addKeybind(keybindSec, {Label = "Go backwards",             Value = Enum.KeyCode.Q})
+    Frameadvanceforwardkeybind  = addKeybind(keybindSec, {Label = "Frame advance forward",     Value = Enum.KeyCode.G})
+    Frameadvancebackwardskeybind= addKeybind(keybindSec, {Label = "Frame advance backward",    Value = Enum.KeyCode.F})
+    Savekeybind                 = addKeybind(keybindSec, {Label = "Save to file",              Value = Enum.KeyCode.P})
+
+    -- ── UTILITY ────────────────────────────────────────────────────────────────
+    utilitySec = addSection(rightColumn, "utility")
+
+    addButton(utilitySec, "Erase Recording", function()
+        ResetCurrentRecording()
+    end)
+
+    addButton(utilitySec, "Rejoin", function()
+        ConsoleMessage("Rejoining...")
+        SaveToFile()
+        SaveTasSettings()
+        task.wait(0.5)
+        if #game.Players:GetPlayers() <= 1 then
+            game.Players.LocalPlayer:Kick("\nRejoining...")
+            task.wait()
+            game:GetService("TeleportService"):Teleport(game.PlaceId, game.Players.LocalPlayer)
+        else
+            game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId, game.JobId, game.Players.LocalPlayer)
+        end
+    end)
+
+    FPSTextbox = addTextbox(utilitySec, {
+        Label = "FPS Cap", Value = tostring(FPS), Placeholder = "Enter FPS...",
+        Callback = function(_, value)
+            local newFPS = tonumber(value)
+            if newFPS and newFPS > 0 and newFPS <= 1000 then
+                FPS = newFPS
+                if setfpscap then pcall(setfpscap, FPS) end
+                TasSettings.FPS = FPS
+                QueueSaveTasSettings()
+                ConsoleMessage("FPS set to "..tostring(FPS))
+            else
+                ConsoleMessage("Invalid FPS value")
+            end
+        end,
+    })
+
+    TASRecordingFPSTextbox = addTextbox(utilitySec, {
+        Label = "TAS FPS", Value = tostring(TASRecordingFPS), Placeholder = "Enter TAS FPS...",
+        Callback = function(_, value)
+            local newFPS = tonumber(value)
+            if newFPS and newFPS > 0 and newFPS <= 1000 then
+                TASRecordingFPS = newFPS
+                TasSettings.TASRecordingFPS = TASRecordingFPS
+                QueueSaveTasSettings()
+                ConsoleMessage("TAS FPS set to "..tostring(TASRecordingFPS))
+            else
+                ConsoleMessage("Invalid TAS FPS value")
+            end
+        end,
+    })
+
+    TeleportTextbox = addTextbox(utilitySec, {Label = "Teleport PlaceId", Placeholder = "Enter PlaceId..."})
+    addButton(utilitySec, "Teleport", function()
+        local placeId = tonumber(TeleportTextbox.Value)
+        if placeId and placeId > 0 then
+            ConsoleMessage("Teleporting to: "..tostring(placeId))
+            SaveToFile()
+            SaveTasSettings()
+            task.wait(0.5)
+            pcall(function()
+                game:GetService("TeleportService"):Teleport(placeId, game.Players.LocalPlayer)
+            end)
+        else
+            ConsoleMessage("Invalid PlaceId")
+        end
+    end)
+end
+
+-- Physics tab
 physSec = addSection(physicsPage, "physics modifiers")
+
+function getPhysicsValues()
+    return {
+        WalkSpeed = tonumber(WalkSpeedTextbox and WalkSpeedTextbox.Value),
+        JumpPower = tonumber(JumpPowerTextbox and JumpPowerTextbox.Value),
+        Gravity = tonumber(GravityTextbox and GravityTextbox.Value),
+        Friction = tonumber(FrictionTextbox and FrictionTextbox.Value),
+        Density = tonumber(DensityTextbox and DensityTextbox.Value),
+    }
+end
+
+function ApplyConfiguredPhysics(ignorePlaybackLock)
+    local values = getPhysicsValues()
+    if Character then
+        local hum = Character:FindFirstChild("Humanoid")
+        local hrp = Character:FindFirstChild("HumanoidRootPart")
+        if hum then
+            if values.WalkSpeed and (ignorePlaybackLock or not AllowChangingPhysics) then
+                hum.WalkSpeed = values.WalkSpeed
+                DefaultWalkSpeed = values.WalkSpeed
+            end
+            if values.JumpPower and (ignorePlaybackLock or not AllowChangingPhysics) then
+                hum.JumpPower = values.JumpPower
+                DefaultJumpPower = values.JumpPower
+            end
+        end
+        if values.Gravity then
+            DefaultGravity = values.Gravity
+            if ignorePlaybackLock or not AllowChangingPhysics then
+                workspace.Gravity = values.Gravity
+            end
+        end
+        if hrp and values.Friction and values.Density then
+            hrp.CustomPhysicalProperties = PhysicalProperties.new(values.Density, values.Friction, 0.5, 1, 1)
+        end
+    end
+end
+
+function EnforcePlaybackPhysics()
+    if not Reading or AllowChangingPhysics then return end
+    ApplyConfiguredPhysics(false)
+end
 
 WalkSpeedTextbox = addTextbox(physSec, {Label = "WalkSpeed", Value = "16", Placeholder = "16",
     Callback = function(_, v)
         local n = tonumber(v)
-        if n and Character and Character:FindFirstChild("Humanoid") then
-            Character.Humanoid.WalkSpeed = n; DefaultWalkSpeed = n
+        if n then
+            DefaultWalkSpeed = n
+            if Character and Character:FindFirstChild("Humanoid") and (not Reading or not AllowChangingPhysics) then
+                Character.Humanoid.WalkSpeed = n
+            end
         end
     end})
 JumpPowerTextbox = addTextbox(physSec, {Label = "JumpPower", Value = "50", Placeholder = "50",
     Callback = function(_, v)
         local n = tonumber(v)
-        if n and Character and Character:FindFirstChild("Humanoid") then
-            Character.Humanoid.JumpPower = n; DefaultJumpPower = n
+        if n then
+            DefaultJumpPower = n
+            if Character and Character:FindFirstChild("Humanoid") and (not Reading or not AllowChangingPhysics) then
+                Character.Humanoid.JumpPower = n
+            end
         end
     end})
 GravityTextbox = addTextbox(physSec, {Label = "Gravity", Value = "196.2", Placeholder = "196.2",
     Callback = function(_, v)
         local n = tonumber(v)
-        if n then DefaultGravity = n; if not Reading and not Frozen then workspace.Gravity = n end end
+        if n then
+            DefaultGravity = n
+            if not Reading or not AllowChangingPhysics then
+                workspace.Gravity = n
+            end
+        end
     end})
 FrictionTextbox = addTextbox(physSec, {Label = "Friction", Value = "0.3", Placeholder = "0.3",
     Callback = function(_, v)
@@ -3080,43 +3484,33 @@ DensityTextbox = addTextbox(physSec, {Label = "Density", Value = "0.7", Placehol
         end
     end})
 
-addButton(physSec, "Apply Physics", function()
-    local ws = tonumber(WalkSpeedTextbox.Value)
-    local jp = tonumber(JumpPowerTextbox.Value)
-    local grav = tonumber(GravityTextbox.Value)
-    local fric = tonumber(FrictionTextbox.Value)
-    local den = tonumber(DensityTextbox.Value)
-    if Character then
-        local hum = Character:FindFirstChild("Humanoid")
-        local hrp = Character:FindFirstChild("HumanoidRootPart")
-        if hum then
-            if ws then hum.WalkSpeed = ws; DefaultWalkSpeed = ws end
-            if jp then hum.JumpPower = jp; DefaultJumpPower = jp end
-        end
-        if grav then DefaultGravity = grav; if not Reading and not Frozen then workspace.Gravity = grav end end
-        if hrp and fric and den then
-            hrp.CustomPhysicalProperties = PhysicalProperties.new(den, fric, 0.5, 1, 1)
-        end
+addCheckbox(physSec, {Label = "Allow changing physics", Default = true, Callback = function(self)
+    AllowChangingPhysics = self.Value
+    if not AllowChangingPhysics then
+        ApplyConfiguredPhysics(false)
     end
+end})
+
+addButton(physSec, "Apply Physics", function()
+    ApplyConfiguredPhysics(true)
     ConsoleMessage("Physics applied")
 end)
 
 addButton(physSec, "Reset Physics", function()
-    if Character then
-        local hum = Character:FindFirstChild("Humanoid")
-        local hrp = Character:FindFirstChild("HumanoidRootPart")
-        if hum then hum.WalkSpeed=16; hum.JumpPower=50; DefaultWalkSpeed=16; DefaultJumpPower=50 end
-        workspace.Gravity=196.2; DefaultGravity=196.2
-        if hrp then hrp.CustomPhysicalProperties = PhysicalProperties.new(0.7, 0.3, 0.5, 1, 1) end
-    end
-    WalkSpeedTextbox:SetValue("16"); JumpPowerTextbox:SetValue("50")
-    GravityTextbox:SetValue("196.2"); FrictionTextbox:SetValue("0.3"); DensityTextbox:SetValue("0.7")
+    WalkSpeedTextbox:SetValue("16")
+    JumpPowerTextbox:SetValue("50")
+    GravityTextbox:SetValue("196.2")
+    FrictionTextbox:SetValue("0.3")
+    DensityTextbox:SetValue("0.7")
+    DefaultWalkSpeed = 16
+    DefaultJumpPower = 50
+    DefaultGravity = 196.2
+    ApplyConfiguredPhysics(true)
     ConsoleMessage("Physics reset")
 end)
 
--- ── VISUALS SECTION ──────────────────────────────────────────────────────────
+-- Visuals tab
 visSec = addSection(visualsPage, "visuals")
-
 addCheckbox(visSec, {Label = "Stats HUD", Default = false, Callback = function(self)
     StatsHudEnabled = self.Value
     if StatsHudEnabled then createStatsHud() else destroyStatsHud() end
@@ -3136,6 +3530,53 @@ addTextbox(visSec, {Label = "Tracer Steps", Value = tostring(TRACER_STEPS),
         if n and n > 0 and n <= 100 then TRACER_STEPS = math.floor(n); clearTracerLines() end
     end})
 
+-- Optional visual toggles moved out of Controls so the main dashboard stays compact.
+addCheckbox(visSec, {Label = "Disable Particle Emitters", Default = false, Callback = function(self)
+    for _, obj in pairs(workspace:GetDescendants()) do
+        if obj:IsA("ParticleEmitter") then obj.Enabled = not self.Value end
+    end
+end})
+addCheckbox(visSec, {Label = "Disable Lighting Effects", Default = false, Callback = function(self)
+    local Lighting = game:GetService("Lighting")
+    if self.Value then
+        if not getgenv().OriginalLightingSettings then
+            getgenv().OriginalLightingSettings = {
+                Ambient=Lighting.Ambient, Brightness=Lighting.Brightness,
+                GlobalShadows=Lighting.GlobalShadows, ClockTime=Lighting.ClockTime,
+            }
+        end
+        Lighting.Ambient=Color3.fromRGB(255,255,255); Lighting.Brightness=2
+        Lighting.GlobalShadows=false; Lighting.ClockTime=14
+        for _, obj in pairs(Lighting:GetChildren()) do
+            if obj:IsA("BloomEffect") or obj:IsA("BlurEffect") or obj:IsA("ColorCorrectionEffect")
+                or obj:IsA("SunRaysEffect") or obj:IsA("DepthOfFieldEffect") then
+                obj.Enabled = false
+            end
+        end
+    else
+        if getgenv().OriginalLightingSettings then
+            for k, v in pairs(getgenv().OriginalLightingSettings) do Lighting[k] = v end
+        end
+        for _, obj in pairs(Lighting:GetChildren()) do
+            if obj:IsA("BloomEffect") or obj:IsA("BlurEffect") or obj:IsA("ColorCorrectionEffect")
+                or obj:IsA("SunRaysEffect") or obj:IsA("DepthOfFieldEffect") then
+                obj.Enabled = true
+            end
+        end
+    end
+end})
+addCheckbox(visSec, {Label = "Motion Blur", Default = false, Callback = function(self)
+    local Lighting = game:GetService("Lighting")
+    if self.Value then
+        if not Lighting:FindFirstChild("TasabilityMotionBlur") then
+            local blur = Instance.new("BlurEffect"); blur.Name="TasabilityMotionBlur"; blur.Size=3; blur.Parent=Lighting
+        end
+    else
+        local blur = Lighting:FindFirstChild("TasabilityMotionBlur")
+        if blur then blur:Destroy() end
+    end
+end})
+
 -- ── CONSOLE TAB ──────────────────────────────────────────────────────────────
 consoleTabFrame = mk("Frame", {
     Size=UDim2.fromScale(1,1), BackgroundColor3=Theme.bg_deep,
@@ -3147,7 +3588,7 @@ tabPages["console"] = consoleTabFrame
 console, ConsoleInput = makeConsole(consoleTabFrame)
 
 -- ── SETTINGS TAB ─────────────────────────────────────────────────────────────
--- Theme section
+-- File actions intentionally do NOT live here; they are handled by the Files panel.
 themeSec = addSection(settingsPage, "theme")
 
 addCombo(themeSec, {
@@ -3159,7 +3600,12 @@ addCombo(themeSec, {
         return names
     end,
     Callback = function(_, presetName)
-        if presetName then setThemePreset(presetName); TasSettings.ThemePreset = presetName; QueueSaveTasSettings(); ConsoleMessage("Theme set to: "..presetName) end
+        if presetName then
+            setThemePreset(presetName)
+            TasSettings.ThemePreset = presetName
+            QueueSaveTasSettings()
+            ConsoleMessage("Theme set to: "..presetName)
+        end
     end,
 })
 
@@ -3176,63 +3622,41 @@ addTextbox(themeSec, {
             Theme.accent_glow = Color3.fromRGB(
                 math.floor(col.R*255*0.80), math.floor(col.G*255*0.80), math.floor(col.B*255*0.80))
             refreshAllTheme()
-            TasSettings.AccentHex = v; QueueSaveTasSettings(); ConsoleMessage("Accent set to: "..v)
+            TasSettings.AccentHex = v
+            QueueSaveTasSettings()
+            ConsoleMessage("Accent set to: "..v)
         end
     end,
 })
 
--- File settings section
 addButton(themeSec, "Save Settings", function()
     SaveTasSettings()
     ConsoleMessage("Settings saved")
 end)
 
-fileSettingsSec = addSection(settingsPage, "replay file")
-
-addLabel(fileSettingsSec, "Current replay file path:")
-replayPathLabel = addLabel(fileSettingsSec, ReplayPath or "N/A")
-
-addCombo(fileSettingsSec, {
-    Text = "Select File", Placeholder = "pick a replay...",
-    GetItems = function()
-        local ok, files = pcall(function() return listfiles(FolderPath) end)
-        return ok and files or {}
-    end,
-    Callback = function(_, path)
-        if not path then return end
-        ReplayPath = path; replayPathLabel.Text = path
-        ReplayNeedsReload = true
-        ConsoleMessage("Replay file set to: "..path)
-    end,
-})
-
-addButton(fileSettingsSec, "Open Folder (copy path)", function()
-    if setclipboard then setclipboard(FolderPath); ConsoleMessage("Copied folder path to clipboard") end
-end)
-
--- Window settings section
--- Use a global holder here instead of another local in the large GUI build scope.
--- The GUI chunk is already close to Luau's 200-register local limit.
 _G.__TasabilityWindowSec = addSection(settingsPage, "window")
-
 addTextbox(_G.__TasabilityWindowSec, {
-    Label = "Window Width", Value = "700", Placeholder = "700",
+    Label = "Window Width", Value = tostring(MainFrame.Size.X.Offset), Placeholder = "700",
     Callback = function(_, v)
         local n = tonumber(v)
-        if n and n >= 400 and n <= 1200 then
+        if n and n >= 700 and n <= 1400 then
             MainFrame.Size = UDim2.fromOffset(n, MainFrame.Size.Y.Offset)
+            QueueSaveTasSettings()
         end
     end,
 })
 addTextbox(_G.__TasabilityWindowSec, {
-    Label = "Window Height", Value = "500", Placeholder = "500",
+    Label = "Window Height", Value = tostring(MainFrame.Size.Y.Offset), Placeholder = "500",
     Callback = function(_, v)
         local n = tonumber(v)
-        if n and n >= 300 and n <= 900 then
+        if n and n >= 500 and n <= 950 then
             MainFrame.Size = UDim2.fromOffset(MainFrame.Size.X.Offset, n)
+            QueueSaveTasSettings()
         end
     end,
 })
+
+switchTab("controls")
 
 end -- GUI scope
 
@@ -3283,7 +3707,7 @@ do
                 ColorCodeFrame.Text = "Status: "..(ColorCodes[Name] and Name or "None")
             end
             if StatusPill then
-                StatusPill.Text = ColorCodes[Name] and Name or "None"
+                StatusPill.Text = "■ "..(ColorCodes[Name] and Name or "None")
                 StatusPill.TextColor3 = ColorCodes[Name] or Theme.txt_muted
             end
         end)
@@ -3381,24 +3805,11 @@ do -- Anticheat bypasses
 	end)()
 end -- Anticheat bypasses
 
--- Animation Functions
-StopAllAnimations = nil -- StopAllAnimations() -> nil
-Reanimate = nil -- Reanimate(Character) -> nil
-
-GetAnimationFunctionFromId = nil -- GetAnimationFunctionFromId(Id) -> function
-onDied = nil -- onDied() -> nil
-onRunning = nil -- onRunning(Speed) -> nil
-onJumping = nil -- onJumping() -> nil
-onClimbing = nil -- onClimbing(Speed) -> nil
-onGettingUp = nil -- onGettingUp() -> nil
-onFreeFall = nil -- onFreeFall() -> nil
-onFallingDown = nil -- onFallingDown() -> nil
-onSeated = nil -- onSeated() -> nil
-onPlatformStanding = nil -- onPlatformStanding() -> nil
-onSwimming = nil -- onSwimming() -> nil
-
-PlayAnimation = nil -- PlayAnimation() -> nil
-setAnimationSpeed = nil -- setAnimationSpeed() -> nil
+-- Animation Functions (assigned inside do-block below)
+local StopAllAnimations, Reanimate, GetAnimationFunctionFromId
+local onDied, onRunning, onJumping, onClimbing, onGettingUp
+local onFreeFall, onFallingDown, onSeated, onPlatformStanding, onSwimming
+local PlayAnimation, setAnimationSpeed
 
 do
 	StopAllAnimations = function()
@@ -3876,61 +4287,19 @@ do
 				end
 			end
 
-			Humanoid.Died:connect(function(...)
-				if AnimateDisabled then
-					return
-				end
-				onDied(...)
-			end)
-			Humanoid.Running:connect(function(Speed)
-				if AnimateDisabled then
-					return
-				end
-				onRunning(Speed)
-			end)
+			local function guarded(fn)
+				return function(...) if not AnimateDisabled then fn(...) end end
+			end
+			Humanoid.Died:connect(guarded(onDied))
+			Humanoid.Running:connect(guarded(onRunning))
 			Humanoid.Jumping:connect(onJumping)
-			Humanoid.Climbing:connect(function(Speed)
-				if AnimateDisabled then
-					return
-				end
-				onClimbing(Speed)
-			end)
-			Humanoid.GettingUp:connect(function(...)
-				if AnimateDisabled then
-					return
-				end
-				onGettingUp(...)
-			end)
-			Humanoid.FreeFalling:connect(function(...)
-				if AnimateDisabled then
-					return
-				end
-				onFreeFall(...)
-			end)
-			Humanoid.FallingDown:connect(function(...)
-				if AnimateDisabled then
-					return
-				end
-				onFallingDown(...)
-			end)
-			Humanoid.Seated:connect(function(...)
-				if AnimateDisabled then
-					return
-				end
-				onSeated(...)
-			end)
-			Humanoid.PlatformStanding:connect(function(...)
-				if AnimateDisabled then
-					return
-				end
-				onPlatformStanding(...)
-			end)
-			Humanoid.Swimming:connect(function(...)
-				if AnimateDisabled then
-					return
-				end
-				onSwimming(...)
-			end)
+			Humanoid.Climbing:connect(guarded(onClimbing))
+			Humanoid.GettingUp:connect(guarded(onGettingUp))
+			Humanoid.FreeFalling:connect(guarded(onFreeFall))
+			Humanoid.FallingDown:connect(guarded(onFallingDown))
+			Humanoid.Seated:connect(guarded(onSeated))
+			Humanoid.PlatformStanding:connect(guarded(onPlatformStanding))
+			Humanoid.Swimming:connect(guarded(onSwimming))
 
 			game:GetService("Players").LocalPlayer.Chatted:connect(function(msg)
 				local emote = ""
@@ -3959,22 +4328,6 @@ do
 		end 
 	end 
 end 
-
--- Camera/Input Functions
-GetZoom = nil -- GetZoom() -> number
-SetZoom = nil -- SetZoom(Zoom) -> nil
-
-GetShiftLockEnabled = nil -- GetShiftLockEnabled() -> bool
-SetShiftLockEnabled = nil -- SetShiftLockEnabled(Enabled) -> nil
-
-SetCameraCFrame = nil -- SetCameraCFrame(NewCFrame) -> nil
-
-BlockInputs = nil -- BlockInputs() -> nil
-UnblockInputs = nil -- UnlockInputs() -> nil
-
-SetCursorIcon = nil -- SetCursorIcon(Icon) -> nil
-SetCursorSize = nil -- SetCursorSize(Size) -> nil
-SetCursor = nil -- SetCursorIcon(CursorName) -> nil
 
 ; (function()
 	-- Load mouse lock action
@@ -4009,17 +4362,13 @@ SetCursor = nil -- SetCursorIcon(CursorName) -> nil
 		end
 		return 12.5
 	end
-	local function SmoothSetZoom(zoom)
-	TargetZoom = zoom
-end
-
-SetZoom = function(Zoom)
-	for _,ZoomController in pairs(ZoomControllers) do
-		pcall(function()
-			ZoomController:SetCameraToSubjectDistance(Zoom)
-		end)
+	SetZoom = function(Zoom)
+		for _, ZoomController in pairs(ZoomControllers) do
+			pcall(function()
+				ZoomController:SetCameraToSubjectDistance(Zoom)
+			end)
+		end
 	end
-end
 
 	
 	GetShiftLockEnabled = function()
@@ -4135,7 +4484,8 @@ end
 
 
 local CO = {}
-do
+-- CO_REGISTER_SCOPE_V3: isolate CO compiler registers from the main chunk.
+(function(CO)
     local CO_EPSILON        = 0.001
     local CO_ATTRIBUTE_NAME = "TAS_ObjectId"
     local CO_SCAN_CHUNK     = 350 -- Yield often enough to keep Record/startup responsive.
@@ -4327,6 +4677,12 @@ do
 
     function CO.RecordFrame()
         if not scanComplete then return {} end
+        if CO._preparedFirstFrameReady and CO._preparedFirstFrame then
+            local first = CO._preparedFirstFrame
+            CO._preparedFirstFrame = nil
+            CO._preparedFirstFrameReady = false
+            return first
+        end
         local delta = {}
         local forceAll = CO._forceFullFrame == true
         for id, part in pairs(objectRegistry) do
@@ -4361,36 +4717,35 @@ do
     end
 
     
-    local coRate    = 15
-    local lerpTargets = {}
-    local lastCoTime  = nil
-    local playbackLerpAlpha = 1
-    local playbackNextDelta = nil
-
-    local coDataWarned = false
+    CO._coRate = 15
+    CO._lerpTargets = {}
+    CO._lastCoTime = nil
+    CO._coDataWarned = false
+    CO._preparedFirstFrame = nil
+    CO._preparedFirstFrameReady = false
     function CO.ApplyFrame(delta, forcedAlpha)
         if delta == nil then
-            if not coDataWarned then
-                coDataWarned = true
+            if not CO._coDataWarned then
+                CO._coDataWarned = true
                 ConsoleMessage("[CO] WARNING: No CO data in replay. Re-record to enable spinner sync.")
             end
             return
         end
-        coDataWarned = false
+        CO._coDataWarned = false
 
         for idStr, components in pairs(delta) do
-            lerpTargets[idStr] = components
+            CO._lerpTargets[idStr] = components
         end
 
         local alpha = forcedAlpha
         if alpha == nil then
             local now = tick()
-            local dt = lastCoTime and math.min(now - lastCoTime, 0.1) or (1/60)
-            lastCoTime = now
-            alpha = 1 - math.exp(-coRate * dt)
+            local dt = CO._lastCoTime and math.min(now - CO._lastCoTime, 0.1) or (1/60)
+            CO._lastCoTime = now
+            alpha = 1 - math.exp(-CO._coRate * dt)
         end
 
-        for idStr, target in pairs(lerpTargets) do
+        for idStr, target in pairs(CO._lerpTargets) do
             local id = tonumber(idStr)
             local part = objectRegistry[id]
             if part and part.Parent then
@@ -4411,16 +4766,16 @@ do
             CO.WarnNoCOData()
             return
         end
-        coDataWarned = false
+        CO._coDataWarned = false
 
         -- Frame[13] is delta data: only objects that changed in the current
         -- sample are present. Keep the last known target for every object.
         for idStr, components in pairs(currentDelta) do
-            lerpTargets[idStr] = components
+            CO._lerpTargets[idStr] = components
         end
 
         alpha = math.clamp(tonumber(alpha) or 0, 0, 1)
-        for idStr, currentTarget in pairs(lerpTargets) do
+        for idStr, currentTarget in pairs(CO._lerpTargets) do
             local id = tonumber(idStr)
             local part = objectRegistry[id]
             if part and part.Parent then
@@ -4608,7 +4963,7 @@ do
             watchConn:Disconnect()
             watchConn = nil
         end
-        lerpTargets  = {}
+        CO._lerpTargets  = {}
         lastCoTime   = nil
         originalAnchored = {}
         for part, conn in pairs(anchoredCandidateConnections) do
@@ -4635,9 +4990,9 @@ do
     CO._activeNext = {}
     CO._FullStateCache = nil
 
-    local _CO_Init = CO.Init
+    CO._OriginalInit = CO.Init
     CO.Init = function(...)
-        _CO_Init(...)
+        CO._OriginalInit(...)
         CO._initialized = true
         CO._forceFullFrame = CO._recordingRequested == true
         if CO._recordingRequested then
@@ -4653,9 +5008,9 @@ do
         CO._FullStateCache = nil
     end
 
-    local _CO_Rebuild = CO.RebuildFromAttributes
+    CO._OriginalRebuildFromAttributes = CO.RebuildFromAttributes
     CO.RebuildFromAttributes = function(...)
-        _CO_Rebuild(...)
+        CO._OriginalRebuildFromAttributes(...)
         CO._initialized = true
         CO._forceFullFrame = false
         CO._coDataWarned = false
@@ -4682,19 +5037,36 @@ do
         startWatching()
     end
 
+    function CO.PrepareFirstRecordingFrame()
+        if not scanComplete then return false end
+        local prepared = {}
+        local processed = 0
+        for id, part in pairs(objectRegistry) do
+            if part and part.Parent then
+                local cf = part.CFrame
+                prepared[tostring(id)] = RoundTable({cf:GetComponents()}, RoundDigits)
+                lastCFrames[id] = cf
+                forceCaptureIds[id] = nil
+            end
+            processed = processed + 1
+            if processed % 150 == 0 then
+                RunService.Heartbeat:Wait()
+            end
+        end
+        CO._preparedFirstFrame = prepared
+        CO._preparedFirstFrameReady = true
+        CO._forceFullFrame = false
+        return true
+    end
+
     function CO.BeginRecording()
         CO._recordingRequested = true
-        CO._forceFullFrame = true
-        -- Force a complete first client-object frame so initially stationary
-        -- client objects are present in the replay from frame 1.
-        lastCFrames = {}
+        CO._forceFullFrame = false
         forceCaptureIds = {}
     end
 
     function CO.ResetTargets()
-        playbackLerpAlpha = 1
-        playbackNextDelta = nil
-        lastCoTime = nil
+        CO._lastCoTime = nil
         CO._currentTargets = {}
         CO._activeIds = {}
         CO._activeIdSet = {}
@@ -4704,9 +5076,7 @@ do
 
     function CO.BeginPlaybackCleanup()
         CO._FullStateCache = nil
-        lastCoTime = nil
-        playbackLerpAlpha = 1
-        playbackNextDelta = nil
+        CO._lastCoTime = nil
     end
     function CO.EndPlaybackCleanup() end
 
@@ -4723,16 +5093,12 @@ do
     end
 
     function CO.GetPartCount()
-        local count = 0
-        for _, _ in pairs(objectRegistry) do
-            count = count + 1
-        end
-        return count
+        return nextId - 1
     end
 
-    local _CO_Stop = CO.Stop
+    CO._OriginalStop = CO.Stop
     CO.Stop = function(...)
-        _CO_Stop(...)
+        CO._OriginalStop(...)
         CO._initialized = false
         CO._forceFullFrame = false
         CO._currentTargets = {}
@@ -4743,26 +5109,11 @@ do
         CO._FullStateCache = nil
     end
 
-end
+end)(CO) -- CO_REGISTER_SCOPE_V3
 
-Freeze = nil
+local Freeze
 
-
--- Replay Functions
-ReplayEncode = nil -- ReplayEncode(Table) -> string
-RecordReplay = nil -- RecordReplay() -> nil [Event]
-StartRecording = nil -- StartRecording() -> nil
-StopRecording = nil -- StopRecording() -> nil
-SaveRecording = nil -- SaveRecording() -> nil
-DiscardRecording = nil -- DiscardRecording() -> nil
-
-StartReading = nil -- StartReading() -> nil
-
-GetCheckpoint = nil -- GetCheckpoint(CheckpointNumber?) -> number
-SetCheckpoint = nil -- SetCheckpoint(FrameIndex?) -> nil
-
-GotoFrame = nil -- GotoFrame(Index) -> nil
-ResetCurrentRecording = nil -- ResetCurrentRecording() -> nil
+-- Replay Functions (assigned below)
 do
 	GetReplayFile = function()
     if not isfolder(string.split(FolderPath,"/")[1]) then
@@ -5054,6 +5405,7 @@ do
 		local frameOut = {}
 
 		for i = 1, frameCount do
+            if i % 64 == 0 then RunService.Heartbeat:Wait() end
 			local frame = Table[i]
 			local previousFrame = Table[i - 1]
 			table.clear(frameOut)
@@ -5157,6 +5509,7 @@ do
 		end
 
 		for i = 1, frameCount do
+            if i % 64 == 0 then RunService.Heartbeat:Wait() end
 			local tag = string.byte(data, pos); pos = pos + 1
 			if tag == 0 then
 				Replay[i] = 0
@@ -5335,7 +5688,10 @@ do
         local oi = 0
         local i = 1
         local len = #data
+        local chunkCounter = 0
         while i <= len do
+            chunkCounter = chunkCounter + 1
+            if chunkCounter % 1024 == 0 then RunService.Heartbeat:Wait() end
             local a = string.byte(data, i) or 0
             local b = (i + 1 <= len) and (string.byte(data, i + 1) or 0) or 0
             local c = (i + 2 <= len) and (string.byte(data, i + 2) or 0) or 0
@@ -5368,7 +5724,10 @@ do
         local out = {}
         local oi = 0
         local i = 1
+        local chunkCounter = 0
         while i <= #data do
+            chunkCounter = chunkCounter + 1
+            if chunkCounter % 1024 == 0 then RunService.Heartbeat:Wait() end
             local aChar = data:sub(i, i)
             local bChar = data:sub(i + 1, i + 1)
             local cChar = data:sub(i + 2, i + 2)
@@ -5492,7 +5851,18 @@ do
         local decoded = json.decode(String)
         if type(decoded) ~= "table" then error("invalid JSON replay root") end
         if decoded.Format == "TASABILITY_JSON3" then
-            if decoded.Version ~= 3 then error("unsupported TASABILITY JSON3 version "..tostring(decoded.Version)) end
+            local jsonVersion = tonumber(decoded.Version) or 1
+
+            -- Some older TASABILITY builds labeled their normal replay object
+            -- as JSON3 Version 1. Accept that representation directly when it
+            -- contains a Replay table.
+            if type(decoded.Replay) == "table" then
+                return decoded.Replay, tonumber(decoded.FPS) or TASRecordingFPS
+            end
+
+            if jsonVersion < 1 or jsonVersion > 3 then
+                error("unsupported TASABILITY JSON3 version "..tostring(decoded.Version))
+            end
             if decoded.Binary ~= "base64" or type(decoded.Data) ~= "string" then
                 error("invalid TASABILITY JSON3 binary payload")
             end
@@ -5540,7 +5910,14 @@ do
 		if Writing then
 			StopRecording()
 			SaveRecording()
-			ConsoleMessage("Recording stopped")
+			-- Persist the completed recording immediately. SaveRecording() only
+			-- moves frames into ReplayTable; it does not write Replay.json.
+			local saved = SaveToFile()
+			if saved then
+				ConsoleMessage("Recording stopped and saved")
+			else
+				ConsoleMessage("Recording stopped (nothing was saved)")
+			end
 			return
 		end
 		SetColorCodeFrame("WaitingForInput")
@@ -5551,13 +5928,35 @@ do
 	StartRecording = function()
 		if not Reading then
 			if CO.ReleaseHeldState then pcall(CO.ReleaseHeldState) end
-			-- Recording must begin immediately. CO initialization continues in the background
-			-- and late-registered client objects are picked up by the existing watchers.
-			-- This removes the Record hotkey wait on a full workspace scan.
-			if not CO._initialized and not CO._initializing then
-				CO.QueueInitialization()
+			-- Prepare CO completely BEFORE enabling Writing. The initial workspace scan
+			-- must not compete with the recording timeline or produce a partial first record.
+			if not CO._initialized then
+				if CO.QueueInitialization then pcall(CO.QueueInitialization) end
+				while CO._initializing do
+					RunService.Heartbeat:Wait()
+				end
+				if not CO._initialized and CO.RebuildFromAttributes then
+					local ok, err = pcall(CO.RebuildFromAttributes)
+					if not ok then
+						ConsoleMessage('[CO] Preparation failed: '..tostring(err))
+						return
+					end
+					CO._initialized = true
+				end
+				if not CO._initialized then
+					ConsoleMessage('[CO] Preparation failed: initialization did not complete')
+					return
+				end
 			end
 			CO._recordingRequested = true
+            if CO.PrepareFirstRecordingFrame then
+                local ok, prepared = pcall(CO.PrepareFirstRecordingFrame)
+                if not ok or not prepared then
+                    CO._recordingRequested = false
+                    ConsoleMessage('[CO] First-frame preparation failed: '..tostring(prepared))
+                    return
+                end
+            end
 			CO.BeginRecording()
 			-- Client FPS cap and TAS recording FPS are independent.
 			-- Example: FPS=120, TASRecordingFPS=60 => client at 120 FPS,
@@ -5582,6 +5981,7 @@ do
 		if not Reading then
 			Writing = false
 			RecordingFPSCapActive = false
+            PendingRecordingFlush = true
 		end
 	end
 	ResetCurrentRecording = function()
@@ -5593,6 +5993,7 @@ do
 		Writing = false
 		Frozen = false
 		RecordingTable = {}
+        table.clear(PlaybackWarmCache)
 		ReplayTable = {}
         ReplaySaveState.Version = ReplaySaveState.Version + 1
         ReplaySaveState.Encoded = nil
@@ -5603,6 +6004,7 @@ do
 		ActiveReplayFPS = nil
 		RecordingFPSCapActive = false
 		RecordingAccumulator = 0
+        PendingRecordingFlush = false
 		PlaybackSourcePosition = 1
 		ReplayNeedsReload = false
 		InputBeganQueue = {}
@@ -5611,7 +6013,16 @@ do
 		HumanoidStateQueue = {}
 		PlaybackPressedKeys = {}
 		PlaybackAccumulator = 0
-		pcall(function() CO.Stop() end)
+		-- Preserve the already-built CO registry across reset. CO.Stop() destroys the
+		-- registry and forces the next recording to rescan the whole workspace.
+		pcall(function()
+			CO._recordingRequested = false
+			CO._forceFullFrame = true
+			CO._coDataWarned = false
+			CO._replayHasNoCO = false
+			if CO.ResetTargets then CO.ResetTargets() end
+			if CO.InvalidateStateCache then CO.InvalidateStateCache() end
+		end)
 		-- Clear the currently selected replay file as well, so reset is persistent.
 		pcall(function()
 			if isfolder(FolderPath) then
@@ -5626,6 +6037,18 @@ do
 	end
 
 	SaveToFile = function()
+    -- Flush any currently buffered recording frames before encoding.
+    -- This makes the Save action reliable even when the recording was just
+    -- stopped or when SaveToFile() is called directly while frames are buffered.
+    if #RecordingTable > 0 then
+        SaveRecording()
+    end
+
+    if #ReplayTable == 0 then
+        ConsoleMessage("Save skipped: replay has no frames (RecordingTable="..tostring(#RecordingTable)..")")
+        return false
+    end
+
     local targetPath = ReplayPath
     if type(targetPath) == "string" and targetPath:lower():sub(-4) == ".tas" then
         targetPath = targetPath:sub(1, -5) .. ".json"
@@ -5647,13 +6070,24 @@ do
     end
 
     ReplayPath = targetPath
-    ReplayNeedsReload = false
-    LastLoadedPath = ReplayPath
-    ConsoleMessage("Saved JSON replay: "..tostring(ReplayPath).." ("..tostring(#ReplayEncoded).." bytes)")
+    -- Force the next Read to validate the file we just wrote instead of silently
+    -- using the in-memory replay cache. This makes first-save/first-read reliable.
+    ReplayNeedsReload = true
+    LastLoadedPath = nil
+    ReplaySaveState.Encoded = ReplayEncoded
+    ReplaySaveState.EncodedVersion = ReplaySaveState.Version
+    ConsoleMessage("Saved JSON replay: "..tostring(ReplayPath).." ("..tostring(#ReplayEncoded).." bytes, "..tostring(#ReplayTable).." frames)")
     return true
 end
 	
 	SaveRecording = function()
+    if PendingRecordingFlush then
+        local deadline = tick() + 0.25
+        while PendingRecordingFlush and tick() < deadline do
+            RunService.Heartbeat:Wait()
+        end
+    end
+
     local count = #RecordingTable
     if count > 0 then
         local recordingFPS = RecordingReplayFPS or TASRecordingFPS
@@ -5687,32 +6121,47 @@ end
 		end
 	end
 	StartReading = function()
-    if not Reading then
-        if ReplayNeedsReload or ReplayPath ~= LastLoadedPath then
-            local fileContent = GetReplayFile()
-            local decoded, replayFPS = ReplayDecode(fileContent)
-            if decoded then
-                ReplayTable = decoded
-                ReplaySaveState.Version = ReplaySaveState.Version + 1
-                ReplaySaveState.Encoded = (type(fileContent) == "string" and fileContent ~= "") and fileContent or nil
-                ReplaySaveState.EncodedVersion = ReplaySaveState.Encoded and ReplaySaveState.Version or -1
-                ReplaySourceFPS = math.max(1, tonumber(replayFPS or TASRecordingFPS) or 1)
-                ActiveReplayFPS = ReplaySourceFPS
-                ReplayTableIndex = 1
-                ReplayNeedsReload = false
-                LastLoadedPath = ReplayPath
-                ConsoleMessage("Decoded replay from file at "..tostring(ActiveReplayFPS).." FPS")
+    if Reading then
+        ConsoleMessage("You are already reading")
+        return
+    end
+    if PendingReadingStart then
+        ConsoleMessage("Replay is already loading")
+        return
+    end
+
+    PendingReadingStart = true
+    task.spawn(function()
+        local ok, err = pcall(function()
+            if ReplayNeedsReload or ReplayPath ~= LastLoadedPath then
+                local fileContent = GetReplayFile()
+                local decoded, replayFPS = ReplayDecode(fileContent)
+                if decoded then
+                    ReplayTable = decoded
+                    ReplaySaveState.Version = ReplaySaveState.Version + 1
+                    ReplaySaveState.Encoded = (type(fileContent) == "string" and fileContent ~= "") and fileContent or nil
+                    ReplaySaveState.EncodedVersion = ReplaySaveState.Encoded and ReplaySaveState.Version or -1
+                    ReplaySourceFPS = math.max(1, tonumber(replayFPS or TASRecordingFPS) or 1)
+                    ActiveReplayFPS = ReplaySourceFPS
+                    ReplayTableIndex = 1
+                    ReplayNeedsReload = false
+                    LastLoadedPath = ReplayPath
+                    ConsoleMessage("Decoded replay from file at "..tostring(ActiveReplayFPS).." FPS")
+                else
+                    ReplayTable = {}
+                    SetColorCodeFrame("Idle")
+                    error("Failed to decode replay")
+                end
             else
-                ReplayTable = {}
+                ConsoleMessage("Using cached replay (no decode needed)")
+            end
+
+            if not (ReplayTable and #ReplayTable > 0) then
                 SetColorCodeFrame("Idle")
-                ConsoleMessage("Failed to decode replay")
+                ConsoleMessage("No replay data to read")
                 return
             end
-        else
-            ConsoleMessage("Using cached replay (no decode needed)")
-        end
 
-        if ReplayTable and #ReplayTable > 0 then
             if Frozen then
                 Freeze(false, true)
             end
@@ -5720,18 +6169,25 @@ end
             Writing = false
             RecordingFPSCapActive = false
             Paused = false
+            EndPlaybackPause()
             AnimateDisabled = false
-            workspace.Gravity = 0
+            if not AllowChangingPhysics then
+                ApplyConfiguredPhysics(false)
+            end
             ReplayTableIndex = 1
+            PlaybackAccumulator = 0
 
-            -- IMPORTANT: rebuild the client-object registry from the recorded
-            -- TAS_ObjectId attributes. This is what message.txt uses for replay.
-            -- CO.Init() scans only currently-unanchored parts and can miss objects
-            -- after a previous playback.
             if CO.ReleaseHeldState then pcall(CO.ReleaseHeldState) end
+
+            if not CO._initialized and not CO._initializing and CO.QueueInitialization then
+                pcall(CO.QueueInitialization)
+            end
+            while CO._initializing do
+                RunService.Heartbeat:Wait()
+            end
             if CO._initialized and CO.ReuseRegistryForPlayback then
                 CO.ReuseRegistryForPlayback()
-            else
+            elseif CO.RebuildFromAttributes then
                 CO.RebuildFromAttributes()
             end
             CO.BeginPlaybackCleanup()
@@ -5739,6 +6195,10 @@ end
             CO._coDataWarned = false
             CO._replayHasNoCO = false
             CO.AnchorAll()
+
+            if not CachedAnimateScript or not CachedAnimateScript.Parent then
+                CachedAnimateScript = findAnimateScript(Character)
+            end
 
             ReplayCharacterCollisionStates = {}
             if Character then
@@ -5750,18 +6210,48 @@ end
                 end
             end
 
+            table.clear(PlaybackWarmCache)
+            local warmCount = math.min(12, #ReplayTable)
+            for warmIndex = 1, warmCount do
+                local warmFrame = ReplayTable[warmIndex]
+                if type(warmFrame) == "table" then
+                    local warmInputs = warmFrame[12] or {{}, {}}
+                    PlaybackWarmCache[warmIndex] = {
+                        hrpCFrame = FastTableToCFrame(warmFrame[1]),
+                        camCFrame = FastTableToCFrame(warmFrame[7]),
+                        hrpVel = FastTableToVector3(warmFrame[5]),
+                        hrpRotVel = FastTableToVector3(warmFrame[6]),
+                        mouseLocation = FastTableToVector2(warmFrame[11]),
+                        animations = warmFrame[2] or {},
+                        animSpeed = warmFrame[3] or 1,
+                        humanoidState = warmFrame[4] or 0,
+                        zoom = warmFrame[8] or 0,
+                        animPose = warmFrame[9] or "Standing",
+                        shiftLock = (warmFrame[10] == 1),
+                        inputBegan = warmInputs[1] or {},
+                        inputEnded = warmInputs[2] or {}
+                    }
+                end
+                if warmIndex % 4 == 0 then
+                    RunService.Heartbeat:Wait()
+                end
+            end
+
             BlockInputs()
             Reading = true
             SetColorCodeFrame("Reading")
             ConsoleMessage("Reading started")
             ConsoleMessage("Length: "..RoundNumber(#ReplayTable/math.max(ReplaySourceFPS, 1)).." seconds (playback "..tostring(ActiveReplayFPS).." FPS)")
-        else
-            ConsoleMessage("No replay data to read")
+        end)
+
+        PendingReadingStart = false
+        if not ok then
+            Reading = false
+            EndPlaybackPause()
             SetColorCodeFrame("Idle")
+            ConsoleMessage("Replay load failed: "..tostring(err))
         end
-    else
-        ConsoleMessage("You are already reading")
-    end
+    end)
 end
 	StopReading = function(PreserveCurrentFrame)
         local savedCFrame, savedVelocity, savedRotVelocity
@@ -5772,6 +6262,7 @@ end
             savedRotVelocity = hrp.RotVelocity
         end
 		Paused = false
+        EndPlaybackPause()
 		ReleaseAllPlaybackKeys()
 		PlaybackAccumulator = 0
 		if Reading then
@@ -5801,9 +6292,9 @@ end
             ReplayAnimateScript = nil
             ReplayAnimateScriptDisabled = nil
 			AnimateDisabled = false -- Enable fake animate script
-			Character.Humanoid.JumpPower = DefaultJumpPower
-			Character.Humanoid.WalkSpeed = DefaultWalkSpeed
-			workspace.Gravity = DefaultGravity
+			if not AllowChangingPhysics then
+				ApplyConfiguredPhysics(false)
+			end
             if PreserveCurrentFrame and savedCFrame and Character:FindFirstChild("HumanoidRootPart") then
                 local hrp = Character.HumanoidRootPart
                 hrp.CFrame = savedCFrame
@@ -5813,6 +6304,7 @@ end
             PlaybackSourcePosition = math.max(1, PlaybackSourcePosition or ReplayTableIndex or 1)
 			SetColorCodeFrame("Idle")
 			ConsoleMessage("Reading stopped")
+            table.clear(PlaybackWarmCache)
 		else
 			ConsoleMessage("You are not reading")
 		end
@@ -5881,10 +6373,10 @@ do
                 end
                 if Humanoid then
                     Humanoid.PlatformStand = false
-                    Humanoid.JumpPower = DefaultJumpPower
-                    Humanoid.WalkSpeed = DefaultWalkSpeed
                 end
-                workspace.Gravity = DefaultGravity
+                if not AllowChangingPhysics then
+                    ApplyConfiguredPhysics(false)
+                end
             end)
             if DoNotRecord then
                 SetColorCodeFrame("Idle")
@@ -5999,13 +6491,9 @@ end
 	end
 end
 
--- Connection Functions
-StateChanged = nil
-CharacterAdded = nil
-InputBegan = nil
-RenderStepped = nil
-Stepped = nil
-CurrentCamera_Changed = nil
+-- Connection Functions (assigned below)
+local StateChanged, CharacterAdded, InputBegan, InputChanged, InputEnded
+local RenderStepped, Stepped, CurrentCamera_Changed
 do
 	StateChanged = function(_,State)
 		table.insert(HumanoidStateQueue,State.Value)
@@ -6104,14 +6592,18 @@ do
 	elseif Input.KeyCode == Pausekeybind.Value and not GameProcessed then
 		-- Pause/Resume reading
 		if Reading then
-			Paused = not Paused
-			if Paused then
-				ConsoleMessage("Paused")
-				SetColorCodeFrame("Frozen") 
-			else
-				ConsoleMessage("Resumed")
-				SetColorCodeFrame("Reading")
-			end
+            if not Paused then
+                Paused = true
+                BeginPlaybackPause()
+                ConsoleMessage("Paused")
+                SetColorCodeFrame("Frozen")
+            else
+                EndPlaybackPause()
+                Paused = false
+                PlaybackAccumulator = 0
+                ConsoleMessage("Resumed")
+                SetColorCodeFrame("Reading")
+            end
 		end
 	end
 end
@@ -6368,11 +6860,9 @@ do -- Setup
 	SetColorCodeFrame("Idle") -- Set color code
     if setfpscap then setfpscap(FPS) end
 
-    -- Prepare CO in the background. This moves the expensive workspace scan
-    -- out of the recording hot path, so pressing the record key is immediate.
-    pcall(function()
-        CO.QueueInitialization()
-    end)
+    -- Prepare CO in the background before the first recording. The scan yields
+    -- periodically, and recording will not begin until it is fully ready.
+    pcall(function() CO.QueueInitialization() end)
 end
 
 function findAnimateScript(character)
@@ -6412,7 +6902,7 @@ end
 
 spawn(function() -- Reading Loop
 
-    local frameCache = {}
+    local frameCache = PlaybackWarmCache
     local lastVelocity = Vector3.new()
     local idleFrameCount = 0
     local idle_threshold = 3
@@ -6425,6 +6915,7 @@ spawn(function() -- Reading Loop
         if Reading then
             if Paused then
                 playbackAccumulator = 0
+                HoldPlaybackPausedState()
                 continue
             end
 
@@ -6463,7 +6954,9 @@ spawn(function() -- Reading Loop
                 continue
             elseif Frame == 1 then
                 Humanoid:ChangeState(15)
-                workspace.Gravity = DefaultGravity
+                if not AllowChangingPhysics then
+                    ApplyConfiguredPhysics(false)
+                end
                 repeat task.wait() until not Dead
                 RunService.Heartbeat:Wait()
                 ReplayTableIndex = ReplayTableIndex + 1
@@ -6476,9 +6969,13 @@ spawn(function() -- Reading Loop
                 continue
             end
 
-            -- Match message.txt: disable the real Animate script from the
-            -- playback loop, after a valid frame has been obtained.
-            local animateScript = findAnimateScript(Character)
+            -- Animate Script is cached at playback start. Only fall back to a
+            -- search if the instance was removed/replaced.
+            local animateScript = CachedAnimateScript
+            if not animateScript or not animateScript.Parent then
+                animateScript = findAnimateScript(Character)
+                CachedAnimateScript = animateScript
+            end
             if animateScript then
                 animateScript.Disabled = true
                 if not ReplayAnimateScript then
@@ -6488,9 +6985,7 @@ spawn(function() -- Reading Loop
             end
 
             AnimateDisabled = true
-            workspace.Gravity = 0
-            Character.Humanoid.JumpPower = 0
-            Character.Humanoid.WalkSpeed = 0
+            EnforcePlaybackPhysics()
 
             if not Character:FindFirstChild("HumanoidRootPart") then
                 RunService.Heartbeat:Wait()
@@ -6669,7 +7164,9 @@ spawn(function() -- Reading Loop
             end
         else
             playbackAccumulator = 0
-            workspace.Gravity = DefaultGravity
+            if not AllowChangingPhysics then
+                ApplyConfiguredPhysics(false)
+            end
             pcall(function()
                 if Character and Character:FindFirstChild("Humanoid") then
                     Character.Humanoid.PlatformStand = false
@@ -6712,10 +7209,7 @@ end)
 spawn(function() -- Writing
     local function buildRepeatFrame(source)
         if type(source) ~= "table" then return nil end
-        local repeatFrame = {}
-        for i = 1, 13 do
-            repeatFrame[i] = source[i]
-        end
+        local repeatFrame = table.move(source, 1, 13, 1, {})
         repeatFrame[2] = {}
         repeatFrame[12] = {{}, {}}
         return repeatFrame
@@ -6786,6 +7280,13 @@ spawn(function() -- Writing
             end
         else
             RecordingAccumulator = 0
+            if PendingRecordingFlush then
+                local finalFrame = captureFrame()
+                if finalFrame then
+                    table.insert(RecordingTable, finalFrame)
+                end
+                PendingRecordingFlush = false
+            end
             InputBeganQueue = {}
             InputEndedQueue = {}
             AnimationQueue = {}
@@ -6799,55 +7300,41 @@ end)
 
 
 spawn(function() -- Update cursor
-	
 	local maxWait = 0
-	repeat 
+	repeat
 		task.wait(0.1)
 		maxWait = maxWait + 0.1
-		if maxWait > 5 then
-			break
-		end
+		if maxWait > 5 then break end
 	until CursorHolder and Cursor and CursorIcon
-	
-	SetCursor("ArrowFarCursor")
 
+	SetCursor("ArrowFarCursor")
 	Cursor.Image = CursorIcon
 	Cursor.Size = CursorSize
 	Cursor.Visible = true
 	Cursor.BackgroundTransparency = 1
 	Cursor.ZIndex = 10000
 
-	
-	local frameCount = 0
+	local lastIcon, lastSize
 	while task.wait() do
-		frameCount = frameCount + 1
-		
 		pcall(function()
-			Cursor.Image = CursorIcon
-			Cursor.Size = CursorSize
-			Cursor.Visible = true
-			
-			local MouseLocation = UserInputService:GetMouseLocation()
-			local ViewportSize = workspace.CurrentCamera.ViewportSize
-
-			local cursorWidth = CursorSize.X.Offset
-			local cursorHeight = CursorSize.Y.Offset
-			local centerOffsetX = -cursorWidth / 2
-			local centerOffsetY = -cursorHeight / 2
-			
-			if ShiftLockEnabled then
-				Cursor.Position = UDim2.fromOffset(
-					(ViewportSize.X / 2) + centerOffsetX,
-					(ViewportSize.Y / 2) + centerOffsetY
-				)
-			else
-				Cursor.Position = UDim2.fromOffset(
-					MouseLocation.X + centerOffsetX,
-					MouseLocation.Y + centerOffsetY
-				)
+			-- Only update image/size when they actually change
+			if CursorIcon ~= lastIcon then
+				Cursor.Image = CursorIcon
+				lastIcon = CursorIcon
 			end
-			
-			if frameCount % 60 == 0 then
+			if CursorSize ~= lastSize then
+				Cursor.Size = CursorSize
+				lastSize = CursorSize
+			end
+
+			local ViewportSize = workspace.CurrentCamera.ViewportSize
+			local hw = CursorSize.X.Offset * 0.5
+			local hh = CursorSize.Y.Offset * 0.5
+			if ShiftLockEnabled then
+				Cursor.Position = UDim2.fromOffset(ViewportSize.X * 0.5 - hw, ViewportSize.Y * 0.5 - hh)
+			else
+				local ml = UserInputService:GetMouseLocation()
+				Cursor.Position = UDim2.fromOffset(ml.X - hw, ml.Y - hh)
 			end
 		end)
 	end
