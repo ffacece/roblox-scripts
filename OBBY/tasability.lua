@@ -1,195 +1,100 @@
--- PLAYBACK SPEED FIX: restored stable TAS frame timing; interpolation never advances ReplayTableIndex.
--- TASABILITY PATCH MARKER: CO_REGISTER_SCOPE_V3
--- Config
-local FPS = 120 -- Client FPS cap. This can be higher than the TAS recording/playback FPS.
-local TASRecordingFPS = 60 -- TAS samples recorded per second. Client FPS can be higher. Playback uses this saved FPS.
-local PlaybackInputs = true -- Sets if you want replays to playback your inputs when playing them (AHK connection is required for mouse scroll playback)
-local PlaybackMouseLocation = true -- Sets if you want replays to move your mouse when playing them (glitchy when loading checkpoints)
-local RoundDigits = 15 -- Rounds all numbers when writing, to greatly decrease file size (set to 50 to disable rounding)
-local ReplayStartTime = 1 -- Number of seconds to wait before starting to read the replay
-local FrameBacktrackCount = 1000 -- Number of frames to backtrack when frozen to see which keys are currently pressed. Increase as much as your computer can handle
-local MinimumJSONFPS = 1/60 -- Lowest you want your FPS to go while encoding/decoding (higher = faster encoding/decoding, lower = better fps) 1/30: 30 fps, 1/60: 60 fps\
-local BypassAntiExploit = false -- If this is true games with anti cheat (like beans) will not kick you, but there is a chance animations will be broken
+-- config
+local TASConfig = {
+    FPS = 120, -- Client FPS cap. This can be higher than the TAS recording/playback FPS.
+    TASRecordingFPS = 60, -- TAS samples recorded per second. Client FPS can be higher. Playback uses this saved FPS.
+    AllowClientObjectManipulation = true, -- Allow recording and playback of client objects (CO).
+    CORecordingRadius = 250, -- Client-object recording radius in studs. 0 = unlimited. Only COs inside this radius are sampled.
+    PlaybackInputs = true, -- Sets if you want replays to playback your inputs when playing them (AHK connection is required for mouse scroll playback)
+    PlaybackMouseLocation = true, -- Sets if you want replays to move your mouse when playing them (glitchy when loading checkpoints)
+    RoundDigits = 15, -- Rounds all numbers when writing, to greatly decrease file size (set to 50 to disable rounding)
+    ReplayStartTime = 1, -- Number of seconds to wait before starting to read the replay
+    FrameBacktrackCount = 1000, -- Number of frames to backtrack when frozen to see which keys are currently pressed. Increase as much as your computer can handle
+    MinimumJSONFPS = 1/60, -- Lowest you want your FPS to go while encoding/decoding (higher = faster encoding/decoding, lower = better fps) 1/30: 30 fps, 1/60: 60 fps
+    ReplayCodecTimeBudget = 0.003, -- Max seconds of codec work before yielding back to Roblox.
+    BypassAntiExploit = false, -- If this is true games with anti cheat (like beans) will not kick you, but there is a chance animations will be broken
 
+    -- Inputs that will not be recorded
+    InputBlacklist = {
+        ["Q"] = true; ["T"] = true; ["F"] = true; ["G"] = true; ["E"] = true;
+        ["U"] = true; ["Z"] = true; ["R"] = true; ["V"] = true;
+    },
 
+    -- Color codes for the color code frame
+    ColorCodes = {
+        WaitingForInput = Color3.new(1,1,0);
+        Recording = Color3.new(1,0,0);
+        Reading = Color3.new(0,0,5,1);
+        Idle = Color3.new(1,1,1);
+        Frozen = Color3.new(0,1,1);
+        None = Color3.new(0,0,0);
+    },
 
--- Inputs that will not be recorded
-local InputBlacklist = {
-	["Q"] = true;
-	["T"] = true;
-	["F"] = true;
-	["G"] = true;
-	["E"] = true;
-	["U"] = true;
-	["Z"] = true;
-	["R"] = true;
-	["V"] = true;
+    -- data roblox cursor xD
+    Cursors = {
+        ArrowFarCursor = {
+            Icon = "rbxasset://textures/Cursors/KeyboardMouse/ArrowFarCursor.png";
+            Size = UDim2.fromOffset(64,64);
+            Offset = Vector2.new(4, 4);
+        };
+        MouseLockedCursor = {
+            Icon = "rbxasset://textures/MouseLockedCursor.png";
+            Size = UDim2.fromOffset(32,32);
+            Offset = Vector2.new(-16,-16);
+        };
+    },
+
+    Version = "V1.2.5",
+    ReplayFileBeginning = "{\"Replay\":" ,
+    ReplayFileEnding = "}",
+    AHKConnectionFolderPath = "Replayability+_AHK",
+    AHKConnectionRequestPath = "Replayability+_AHK/Request",
+    TASCompressionLevel = 3, -- Save-only Zstd level. Lower = faster save, higher = smaller file. Playback is unaffected.
+    FIRST_RECORD_FIX = "CO_READY_BEFORE_WRITE__KEEP_CO_ON_RESET__READ_FROM_DISK_AFTER_SAVE",
 }
 
--- Color codes for the color code frame
-local ColorCodes = {
-	WaitingForInput = Color3.new(1,1,0);
-	Recording = Color3.new(1,0,0);
-	Reading = Color3.new(0,0,5,1);
-	Idle = Color3.new(1,1,1);
-	Frozen = Color3.new(0,1,1);
-	
-	None = Color3.new(0,0,0);
+local TASServices = {
+    UserInputService = game:GetService("UserInputService"), RunService = game:GetService("RunService"), HttpService = game:GetService("HttpService"),
+    ContextActionService = game:GetService("ContextActionService"), GuiService = game:GetService("GuiService"), VirtualInputManager = game:GetService("VirtualInputManager"),
+    Player = game.Players.LocalPlayer, Mouse = nil, random = math.random, min = math.min, max = math.max, floor = math.floor, ceil = math.ceil,
+    PlayerModule = nil, ShiftLockBoundKeys = nil, ShiftLockEnabled = false, GuiInset = nil,
 }
-
--- data roblox cursor xD
-local Cursors = {
-	["ArrowFarCursor"] = {
-		Icon = "rbxasset://textures/Cursors/KeyboardMouse/ArrowFarCursor.png";
-		Size = UDim2.fromOffset(64,64);
-		Offset = Vector2.new(4, 4);
-	};
-	["MouseLockedCursor"] = {
-		Icon = "rbxasset://textures/MouseLockedCursor.png";
-		Size = UDim2.fromOffset(32,32);
-		Offset = Vector2.new(-16,-16);
-	};
+TASServices.Mouse = TASServices.Player:GetMouse()
+TASServices.PlayerModule = TASServices.Player.PlayerScripts:WaitForChild("PlayerModule")
+TASServices.ShiftLockBoundKeys = TASServices.PlayerModule:WaitForChild("CameraModule"):WaitForChild("MouseLockController"):WaitForChild("BoundKeys")
+TASServices.GuiInset = TASServices.GuiService:GetGuiInset()
+local TASPaths = {
+    pathVisualsEnabled = false, pathLines = {}, pathStartText = nil, pathEndText = nil, ReplayNeedsReload = true, LastLoadedPath = nil,
+    ExecutionTick = tick(), PlaceId = game.PlaceId, FolderPath = nil, ReplayPath = nil,
 }
-
--- Constants
-local Version = "V1.2.5"
-local UserInputService = game:GetService("UserInputService")
-local RunService = game:GetService("RunService")
-local HttpService = game:GetService("HttpService")
-local ContextActionService = game:GetService("ContextActionService")
-local GuiService = game:GetService("GuiService")
-local VirtualInputManager = game:GetService("VirtualInputManager")
-local Player = game.Players.LocalPlayer
-local Mouse = Player:GetMouse()
-local random = math.random
-local min = math.min
-local max = math.max
-local floor = math.floor
-local ceil = math.ceil
-local ReplayFileBeginning = "{\"Replay\":"
-local ReplayFileEnding = "}"
-local PlayerModule = Player.PlayerScripts:WaitForChild("PlayerModule")
-local ShiftLockBoundKeys = PlayerModule:WaitForChild("CameraModule"):WaitForChild("MouseLockController"):WaitForChild("BoundKeys")
-local ShiftLockEnabled = false
-local GuiInset = GuiService:GetGuiInset()
-
--- Variables
-local pathVisualsEnabled = false
-local pathLines = {}
-local pathStartText = nil
-local pathEndText = nil
-local PlaybackPressedKeys = {}
-local ReplayNeedsReload = true -- Flag to track if we need to reload from file
-local LastLoadedPath = nil -- Track which file was last loaded
-local ExecutionTick = tick()
-local PlaceId = game.PlaceId
--- These will be set later --
-local Character = nil
-local Humanoid = nil
-local RootPart = nil
-local DefaultGravity = nil
-local DefaultJumpPower = nil
-local DefaultWalkSpeed = nil
-local Resolution = nil
-local ConsoleMessage = print
------------------------------
-local Reading = false
-local Paused = false 
-local Writing = false
-local Saving = false
-local AnimateDisabled = false
-local Checkpoints = {}
-local RenderSteppedConnections = {}
-local SteppedConnections = {}
-local FolderPath = "Tasability\\"..tostring(PlaceId)
-local ReplayPath = FolderPath.."\\Replay.json"
-if isfolder(FolderPath) then
-    local legacyReplayPath, jsonReplayPath
-    for _, filePath in ipairs(listfiles(FolderPath)) do
-        if type(filePath) == "string" then
-            local lowerPath = filePath:lower()
-            if not jsonReplayPath and lowerPath:sub(-5) == ".json" then
-                jsonReplayPath = filePath
-            elseif not legacyReplayPath and lowerPath:sub(-4) == ".tas" then
-                legacyReplayPath = filePath
-            end
-        end
-    end
-    ReplayPath = jsonReplayPath or legacyReplayPath or ReplayPath
+TASPaths.FolderPath = "Tasability\\"..tostring(TASPaths.PlaceId)
+TASPaths.ReplayPath = nil -- No replay file is created automatically; choose/create one from Files.
+local TASCharacter = {Character=nil, Humanoid=nil, RootPart=nil, DefaultGravity=nil, DefaultJumpPower=nil, DefaultWalkSpeed=nil, Resolution=nil, ConsoleMessage=print}
+local TASRuntime = {
+    Reading=false, Paused=false, Writing=false, Saving=false, AnimateDisabled=false, Checkpoints={}, RenderSteppedConnections={}, SteppedConnections={},
+    PlaybackPressedKeys={}, ReplayTable={}, RecordingTable={}, RecordingFPSCapActive=false, RecordingReplayFPS=nil,
+    ActiveReplayFPS=TASConfig.TASRecordingFPS, ReplaySourceFPS=TASConfig.TASRecordingFPS,
+    ReplaySaveState={Version=0, Encoded=nil, EncodedVersion=-1}, SaveGeneration=0, PlaybackAccumulator=0, PlaybackSourcePosition=1,
+    RecordingAccumulator=0, RecordingInterval=0, PlaybackInterval=0, ReplayRootWasAnchored=false, ReplayTableIndex=0, AnimationQueue={}, ForceAnimationSync=false, RunSpeed=0, ClimbSpeed=0,
+    HumanoidStateQueue={}, InputBeganQueue={}, InputEndedQueue={}, Cursor=Instance.new("ImageLabel"), CursorIcon=nil, CursorSize=nil,
+    CursorOffset=nil, Dead=false, CameraCFrame=workspace.CurrentCamera.CFrame, Pressed={}, IgnoreGameProcessed=false,
+}
+local TASFreeze = {
+    Frozen=false, FreezeFrame=1, SeekDirection=0, SeekDirectionMultiplier=1, SeekAccumulator=0,
+    ReplayCharacterCollisionStates=nil, ReplayAnimateScript=nil, ReplayAnimateScriptDisabled=nil, FrozenCameraFollowsReplay=false,
+    FrozenMouseBehavior=nil, PendingRecordingStart=false, PendingReadingStart=false, COInitializationQueued=false,
+    FrozenCameraType=nil, FrozenCameraBindName="TasabilityFrozenCamera", FrozenCharacterBindName="TasabilityFrozenCharacter", FrozenCameraCFrame=nil, FrozenHeldCO=false,
+    ResumeCFrame=nil, ResumeVelocity=nil, ResumeRotVelocity=nil, ResumeHumanoidState=nil, ResumeAnimPose=nil, ResumeAnimSpeed=nil,
+}
+local TASPause = {PausedCharacterCFrame=nil, PausedCameraCFrame=nil, PausedCameraType=nil, PausedCameraBindName="TasabilityPausedCamera", PendingRecordingFlush=false, CachedAnimateScript=nil, PlaybackWarmCache={}}
+local function ClearPlaybackWarmCache()
+    local processFreezeFrame = TASPause.PlaybackWarmCache.ProcessFreezeFrame
+    table.clear(TASPause.PlaybackWarmCache)
+    TASPause.PlaybackWarmCache.ProcessFreezeFrame = processFreezeFrame
 end
-local AHKConnectionFolderPath = "Replayability+_AHK"
-local AHKConnectionRequestPath = "Replayability+_AHK/Request"
-local ReplayTable = {} -- Should always be used instead of the json string except when encoding or decoding
-local RecordingTable = {} -- List of frames that will be added to ReplayTable if recording is saved
-local RecordingFPSCapActive = false -- Compatibility flag; recording never changes the client FPS cap.
-local RecordingReplayFPS = nil -- FPS used by the currently buffered recording.
-local ActiveReplayFPS = TASRecordingFPS -- Playback FPS follows the replay recording FPS.
-local ReplaySourceFPS = TASRecordingFPS -- FPS the replay data was recorded/saved at.
-
--- Forward declarations used by GUI callbacks before replay functions are assigned.
-local ReplayEncode, RecordReplay, StartRecording, StopRecording
-local SaveRecording, DiscardRecording, StartReading, StopReading
-local GetCheckpoint, SetCheckpoint, GotoFrame, ResetCurrentRecording
--- Default: game scripts/pads are allowed to change physics values during playback.
-AllowChangingPhysics = true -- TAS6: game/boost pads may change physics during playback
-
-local TASCompressionLevel = 3 -- Save-only Zstd level. Lower = faster save, higher = smaller file. Playback is unaffected.
-local ReplaySaveState = {Version = 0, Encoded = nil, EncodedVersion = -1} -- Save-only cache; never used by playback.
-local PlaybackAccumulator = 0 -- Wall-clock accumulator used to pace playback.
-local PlaybackSourcePosition = 1 -- Fractional source-frame position for playback resampling.
-local RecordingAccumulator = 0 -- Wall-clock accumulator used to pace recording samples.
-local ReplayRootWasAnchored = false
-local ReplayTableIndex = 0 -- The index in ReplayTable that will be read from
-local AnimationQueue = {} -- Functions that were called by the animation script (clear every frame)
-local RunSpeed = 0 -- Set in the onRunning function, reset to 0 every frame (AnimationId 2)
-local ClimbSpeed = 0 -- Set in the onClimbing function, reset to 0 every frame (AnimationId 4)
-local HumanoidStateQueue = {} -- States that were activated on the humanoid (clear every frame)
-local InputBeganQueue = {} -- Inputs that have just began (for recording inputs) (clear every frame)
-local InputEndedQueue = {} -- Inputs that have just ended (for recording inputs) (clear every frame)
-local Cursor = Instance.new("ImageLabel") -- Fake cursor so the icon doesnt change all the time
-local CursorIcon = nil -- Icon of the cursor
-local CursorSize = nil -- Size of the cursor
-local CursorOffset = nil -- Offset of the cursor from UserInputService:GetMouseLocation()
-local Dead = false -- If the player is dead this is true
-local CameraCFrame = workspace.CurrentCamera.CFrame -- Used when reading so that nothing else can change the camera's CFrame
-local Pressed = {} -- Current keys that are pressed
-local IgnoreGameProcessed = false -- To ignore GameProcessed in InputBegan, InputChanged, InputEnded
-
--- Tasability update
-local Frozen = false
-local FreezeFrame = 1 -- Frame to render while frozen
-local SeekDirection = 0 -- Stays 0 normally, -1 when going backwards while frozen, 1 when going fowards
-local SeekDirectionMultiplier = 1 -- To go faster or slower when seeking with R and T
-local SeekAccumulator = 0 -- Wall-clock accumulator for Q/T seeking at TASRecordingFPS.
-local ReplayCharacterCollisionStates = nil -- Original CanCollide state of character parts during playback.
-local ReplayAnimateScript = nil
-local ReplayAnimateScriptDisabled = nil
-local FrozenCameraFollowsReplay = false -- Legacy compatibility flag; Frozen camera follows the selected replay frame.
-local FrozenMouseBehavior = nil
-local PendingRecordingStart = false
-local PendingReadingStart = false
-local COInitializationQueued = false
-local FrozenCameraType = nil
-local FrozenCameraBindName = "TasabilityFrozenCamera"
-local FrozenCameraCFrame = nil
-local FrozenHeldCO = false
-
--- Playback-pause state. Pause freezes the character and camera without touching the mouse.
-local PausedCharacterCFrame = nil
-local PausedCameraCFrame = nil
-local PausedCameraType = nil
-local PausedCameraBindName = "TasabilityPausedCamera"
-local PendingRecordingFlush = false
-local FIRST_RECORD_FIX = "CO_READY_BEFORE_WRITE__KEEP_CO_ON_RESET__READ_FROM_DISK_AFTER_SAVE"
-local CachedAnimateScript = nil
-local PlaybackWarmCache = {}
-
--- Camera/Input functions are used by GUI/HUD callbacks defined earlier in the file.
--- Keep these locals declared before those callbacks so they do not resolve as globals.
-local GetZoom, SetZoom, GetShiftLockEnabled, SetShiftLockEnabled
-local SetCameraCFrame, BlockInputs, UnblockInputs, SetCursor
-
-
+local TASFunctions = {}
+local TASAnimation = {pose="Standing", currentAnimSpeed=1.0, currentAnimName="idle", currentAnimTrack=nil}
+local TASTracer = {TracerEnabled=false, TracerLines={}, TracerLandingLines={}, TRACER_STEPS=30, TRACER_LOOKAHEAD=0.5, TRACER_LANDING_SIZE=7, TRACER_LANDING_THICKNESS=2}
+local TASUtilityFunctions = {}
 -- Converting inputs
 -- To add to this table, use https://docs.microsoft.com/en-us/windows/win32/inputdev/virtual-key-codes
 local InputCodes = {
@@ -235,11 +140,9 @@ keypress = keypress or keydown
 keyrelease = keyrelease or keyup
 
 -- Variables used in Animate script
-local pose = "Standing" -- The pose that is used in the move function
-local currentAnimSpeed = 1.0 -- Animation speed
 
 -- Other
-local GUIParent = Player:WaitForChild("PlayerGui")
+local GUIParent = TASServices.Player:WaitForChild("PlayerGui")
 local json
 do -- Overwriting JSON
 	json = (function()
@@ -273,12 +176,12 @@ do -- Overwriting JSON
 																			local currentstr
 																			local lasti
 																			local function checkwait(i)
-																				if tick() - t > MinimumJSONFPS then
+																				if tick() - t > TASConfig.MinimumJSONFPS then
 																					lasti = lasti or i
 																					if i >= lasti then
 																						local Type = (type(currentstr) == "table" and "En") or (type(currentstr) == "string" and "De")
 																						if Type then
-																							ConsoleMessage(Type.."coding... ("..tostring(i).."/"..tostring(#currentstr)..")")
+																							TASCharacter.ConsoleMessage(Type.."coding... ("..tostring(i).."/"..tostring(#currentstr)..")")
 																						end
 																						game:GetService("RunService").Stepped:Wait()
 																						t = tick()
@@ -677,38 +580,58 @@ end
 -- General Functions
 
 
-local TracerEnabled = false
-local TracerLines = {}
-local TRACER_STEPS = 30
-local TRACER_LOOKAHEAD = 0.5 -- seconds ahead to predict
 
-local function clearTracerLines()
-    for _, line in pairs(TracerLines) do
+local function clearTracerObjects()
+    for _, line in pairs(TASTracer.TracerLines) do
         pcall(function() line:Remove() end)
     end
-    TracerLines = {}
+    for _, line in pairs(TASTracer.TracerLandingLines) do
+        pcall(function() line:Remove() end)
+    end
+    TASTracer.TracerLines = {}
+    TASTracer.TracerLandingLines = {}
+end
+
+local function ensureTracerLandingCross()
+    while #TASTracer.TracerLandingLines < 2 do
+        local ok, line = pcall(function()
+            local l = Drawing.new("Line")
+            l.Thickness = TASTracer.TRACER_LANDING_THICKNESS
+            l.Visible = false
+            return l
+        end)
+        if not ok then
+            TASCharacter.ConsoleMessage("Tracer: failed to create landing marker")
+            return false
+        end
+        table.insert(TASTracer.TracerLandingLines, line)
+    end
+    return true
 end
 
 local function updateTracer()
-    if not TracerEnabled then
-        clearTracerLines()
+    if not TASTracer.TracerEnabled then
+        clearTracerObjects()
         return
     end
 
     if not Drawing then
-        ConsoleMessage("Tracer: Drawing API not supported")
-        TracerEnabled = false
+        TASCharacter.ConsoleMessage("Tracer: Drawing API not supported")
+        TASTracer.TracerEnabled = false
         return
     end
 
-    if not RootPart then return end
+    if not TASCharacter.RootPart or not TASCharacter.RootPart.Parent then return end
 
     local cam = workspace.CurrentCamera
-    local gravity = Vector3.new(0, -workspace.Gravity, 0)
-    local dt = TRACER_LOOKAHEAD / TRACER_STEPS
+    if not cam then return end
 
-    -- Make sure we have enough line objects
-    while #TracerLines < TRACER_STEPS do
+    local stepCount = math.max(1, math.floor(tonumber(TASTracer.TRACER_STEPS) or 30))
+    local lookahead = math.max(0.01, tonumber(TASTracer.TRACER_LOOKAHEAD) or 0.5)
+    local dt = lookahead / stepCount
+    local gravity = Vector3.new(0, -workspace.Gravity, 0)
+
+    while #TASTracer.TracerLines < stepCount do
         local ok, line = pcall(function()
             local l = Drawing.new("Line")
             l.Thickness = 2
@@ -716,66 +639,143 @@ local function updateTracer()
             return l
         end)
         if ok then
-            table.insert(TracerLines, line)
+            table.insert(TASTracer.TracerLines, line)
         else
-            ConsoleMessage("Tracer: Drawing.new failed")
+            TASCharacter.ConsoleMessage("Tracer: Drawing.new failed")
             return
         end
     end
 
-    -- Simulate trajectory
-    local pos = RootPart.Position
-    local vel = RootPart.Velocity
-    local points = table.create(TRACER_STEPS + 1)
+    if not ensureTracerLandingCross() then
+        for _, line in ipairs(TASTracer.TracerLandingLines) do
+            line.Visible = false
+        end
+    end
+
+    local points = table.create(stepCount + 1)
+    local pos = TASCharacter.RootPart.Position
+    local vel = TASCharacter.RootPart.AssemblyLinearVelocity
     points[1] = pos
 
-    local onGround = Humanoid and (
-        Humanoid:GetState() == Enum.HumanoidStateType.Running or
-        Humanoid:GetState() == Enum.HumanoidStateType.RunningNoPhysics
-    )
+    local state = TASCharacter.Humanoid and TASCharacter.Humanoid:GetState()
+    local onGround = state == Enum.HumanoidStateType.Running
+        or state == Enum.HumanoidStateType.RunningNoPhysics
+        or state == Enum.HumanoidStateType.Landed
 
-    for i = 1, TRACER_STEPS do
+    local landingPosition = nil
+    local landingSegment = stepCount
+
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.FilterDescendantsInstances = {TASCharacter.Character}
+    rayParams.IgnoreWater = true
+
+    for i = 1, stepCount do
         if onGround then
             pos = pos + vel * dt
         else
             vel = vel + gravity * dt
             pos = pos + vel * dt
+
+            -- Stop simulation at the FIRST surface hit.
+            local from = points[i]
+            local delta = pos - from
+            if delta.Magnitude > 0.001 then
+                local hit = workspace:Raycast(from, delta, rayParams)
+                if hit and hit.Instance and hit.Instance.CanCollide then
+                    landingPosition = hit.Position
+                    points[i + 1] = hit.Position
+                    landingSegment = i
+                    break
+                end
+            end
         end
+
         points[i + 1] = pos
     end
 
-    -- Draw lines between points
-    local nPoints = #points
-    local tDenom = nPoints - 2
-    for i = 1, nPoints - 1 do
-        local line = TracerLines[i]
+    -- If no collision happened inside the lookahead, optionally project the
+    -- final point down and use that as the landing marker only. The visible
+    -- trajectory itself still ends at the final simulated point.
+    if not landingPosition and not onGround then
+        local finalPoint = points[#points]
+        local floorHit = workspace:Raycast(
+            finalPoint + Vector3.new(0, 2, 0),
+            Vector3.new(0, -2048, 0),
+            rayParams
+        )
+        if floorHit and floorHit.Instance and floorHit.Instance.CanCollide then
+            landingPosition = floorHit.Position
+        end
+    end
+
+    -- Hide every unused segment first.
+    for i = landingSegment + 1, #TASTracer.TracerLines do
+        TASTracer.TracerLines[i].Visible = false
+    end
+
+    local visibleSegments = math.min(landingSegment, #points - 1)
+    local denom = math.max(1, visibleSegments - 1)
+
+    for i = 1, visibleSegments do
+        local line = TASTracer.TracerLines[i]
         if not line then continue end
+
         local s1, on1 = cam:WorldToViewportPoint(points[i])
         local s2, on2 = cam:WorldToViewportPoint(points[i + 1])
+
         if on1 and on2 then
             line.From = Vector2.new(s1.X, s1.Y)
-            line.To   = Vector2.new(s2.X, s2.Y)
-            local t = (i - 1) / tDenom
+            line.To = Vector2.new(s2.X, s2.Y)
+
+            local t = (i - 1) / denom
             line.Color = Color3.fromRGB(
-                math.floor(50  + 205 * t),
-                math.floor(255 - 205 * t),
-                50
+                math.floor(70 + 185 * t),
+                math.floor(245 - 170 * t),
+                70
             )
             line.Visible = true
         else
             line.Visible = false
         end
     end
+
+    -- Landing cross.
+    if landingPosition and #TASTracer.TracerLandingLines >= 2 then
+        local center, visible = cam:WorldToViewportPoint(landingPosition + Vector3.new(0, 0.08, 0))
+        if visible then
+            local p = Vector2.new(center.X, center.Y)
+
+            TASTracer.TracerLandingLines[1].From = p + Vector2.new(-TASTracer.TRACER_LANDING_SIZE, -TASTracer.TRACER_LANDING_SIZE)
+            TASTracer.TracerLandingLines[1].To = p + Vector2.new(TASTracer.TRACER_LANDING_SIZE, TASTracer.TRACER_LANDING_SIZE)
+            TASTracer.TracerLandingLines[2].From = p + Vector2.new(-TASTracer.TRACER_LANDING_SIZE, TASTracer.TRACER_LANDING_SIZE)
+            TASTracer.TracerLandingLines[2].To = p + Vector2.new(TASTracer.TRACER_LANDING_SIZE, -TASTracer.TRACER_LANDING_SIZE)
+
+            TASTracer.TracerLandingLines[1].Color = Color3.fromRGB(255, 255, 255)
+            TASTracer.TracerLandingLines[2].Color = Color3.fromRGB(255, 255, 255)
+            TASTracer.TracerLandingLines[1].Thickness = TASTracer.TRACER_LANDING_THICKNESS
+            TASTracer.TracerLandingLines[2].Thickness = TASTracer.TRACER_LANDING_THICKNESS
+            TASTracer.TracerLandingLines[1].Visible = true
+            TASTracer.TracerLandingLines[2].Visible = true
+        else
+            TASTracer.TracerLandingLines[1].Visible = false
+            TASTracer.TracerLandingLines[2].Visible = false
+        end
+    else
+        if TASTracer.TracerLandingLines[1] then TASTracer.TracerLandingLines[1].Visible = false end
+        if TASTracer.TracerLandingLines[2] then TASTracer.TracerLandingLines[2].Visible = false end
+    end
 end
 
 -- Hook into existing RenderStepped connections
-RenderSteppedConnections.GhostAndTracer = function()
-    if TracerEnabled then
+TASRuntime.RenderSteppedConnections.GhostAndTracer = function()
+    if TASTracer.TracerEnabled then
         updateTracer()
-    elseif #TracerLines > 0 then
-        clearTracerLines()
+    elseif #TASTracer.TracerLines > 0 or #TASTracer.TracerLandingLines > 0 then
+        clearTracerObjects()
     end
 end
+
 
 -- Fast conversion functions for better performance
 local function FastTableToCFrame(t)
@@ -789,73 +789,69 @@ end
 local function FastTableToVector2(t)
 	return Vector2.new(t[1], t[2])
 end
-local RandomString --RandomString() -> string
-local RoundNumber -- RoundNumber(Number,Digits) -> number
-local Vector3ToTable -- Vector3ToTable(Vector3) -> table
-local TableToVector3 -- TableToVector3(Table) -> vector3
-local CFrameToTable -- CFrameToTable(CFrame) -> table
-local TableToCFrame -- TableToCFrame(Table) -> cframe
-local RoundVector3 -- RoundVector3(Vector3,Digits) -> vector3
-local RoundCFrame -- RoundCFrame(CFrame,Digits) -> cframe
-local FindListIndex -- FindListIndex(Table,Search) -> number
-local WaitForInput -- WaitForInput() -> nil
 do
-	RandomString = function()
+	TASUtilityFunctions.RandomString = function()
 		local str = ""
-		for _ = 1, random(1, 20) do
-			local t = random(1, 3)
+		for _ = 1, TASServices.random(1, 20) do
+			local t = TASServices.random(1, 3)
 			if t == 1 then
-				str = str .. string.char(random(97, 122))
+				str = str .. string.char(TASServices.random(97, 122))
 			elseif t == 2 then
-				str = str .. string.char(random(65, 90))
+				str = str .. string.char(TASServices.random(65, 90))
 			else
-				str = str .. string.char(random(48, 57))
+				str = str .. string.char(TASServices.random(48, 57))
 			end
 		end
 		return str
 	end
-	RoundNumber = function(Number,Digits)
-		local Mult = 10^max(tonumber(Digits) or 0,0)
-		return floor(Number*Mult+0.5)/Mult
+	TASUtilityFunctions.RoundNumber = function(Number,Digits)
+		local Mult = 10^TASServices.max(tonumber(Digits) or 0,0)
+		return TASServices.floor(Number*Mult+0.5)/Mult
 	end
-	Vector3ToTable = function(V3)
+	TASUtilityFunctions.Vector3ToTable = function(V3)
 		return {V3.X,V3.Y,V3.Z}
 	end
-	TableToVector3 = function(Table)
-		return Vector3.new(unpack(Table))
+	TASUtilityFunctions.TableToVector3 = function(Table)
+		return Vector3.new(Table[1], Table[2], Table[3])
 	end
 	Vector2ToTable = function(V2)
 		return {V2.X,V2.Y}
 	end
 	TableToVector2 = function(Table)
-		return Vector2.new(unpack(Table))
+		return Vector2.new(Table[1], Table[2])
 	end
-	CFrameToTable = function(CF)
+	TASUtilityFunctions.CFrameToTable = function(CF)
 		return {CF:GetComponents()}
 	end
-	TableToCFrame = function(Table)
-		return CFrame.new(unpack(Table))
+	TASUtilityFunctions.TableToCFrame = function(Table)
+		return CFrame.new(Table[1], Table[2], Table[3], Table[4], Table[5], Table[6], Table[7], Table[8], Table[9], Table[10], Table[11], Table[12])
 	end
 	RoundTable = function(Table,Digits)
 		local RoundedTable = {}
-		for Index,Number in pairs(Table) do
-			RoundedTable[Index] = RoundNumber(Number,Digits)
+		local mult = 10^TASServices.max(tonumber(Digits) or 0, 0)
+		if mult == 1 then
+			for i = 1, #Table do RoundedTable[i] = Table[i] end
+		else
+			for i = 1, #Table do
+				local Number = Table[i]
+				RoundedTable[i] = TASServices.floor(Number * mult + 0.5) / mult
+			end
 		end
 		return RoundedTable
 	end
-	FindListIndex = function(Table,Search)
+	TASUtilityFunctions.FindListIndex = function(Table,Search)
 		for Index,Value in pairs(Table) do
 			if Value == Search then
 				return Index
 			end
 		end
 	end
-	WaitForInput = function()
+	TASUtilityFunctions.WaitForInput = function()
 		local KeyPressed = Instance.new("BindableEvent")
 		local InputBeganConnection
-		InputBeganConnection = UserInputService.InputBegan:Connect(function(Input)
+		InputBeganConnection = TASServices.UserInputService.InputBegan:Connect(function(Input)
 			if Input.UserInputType == Enum.UserInputType.Keyboard then
-				RunService.RenderStepped:Wait()
+				TASServices.RunService.RenderStepped:Wait()
 				KeyPressed:Fire()
 			end
 		end)
@@ -866,92 +862,92 @@ do
 end
 
 local function ReleaseAllPlaybackKeys()
-    for _, Code in pairs(PlaybackPressedKeys) do
+    for _, Code in pairs(TASRuntime.PlaybackPressedKeys) do
         if Code == "b1" then mouse1release()
         elseif Code == "b2" then mouse2release()
         elseif type(Code) == "number" then keyrelease(Code)
         end
     end
-    PlaybackPressedKeys = {}
+    TASRuntime.PlaybackPressedKeys = {}
 end
 
 local function BeginPlaybackPause()
-    if not Reading then return end
+    if not TASRuntime.Reading then return end
 
     ReleaseAllPlaybackKeys()
-    PlaybackAccumulator = 0
+    TASRuntime.PlaybackAccumulator = 0
 
-    if Character and Character:FindFirstChild("HumanoidRootPart") then
-        local hrp = Character.HumanoidRootPart
-        PausedCharacterCFrame = hrp.CFrame
+    if TASCharacter.Character and TASCharacter.Character:FindFirstChild("HumanoidRootPart") then
+        local hrp = TASCharacter.Character.HumanoidRootPart
+        TASPause.PausedCharacterCFrame = hrp.CFrame
         hrp.AssemblyLinearVelocity = Vector3.zero
         hrp.AssemblyAngularVelocity = Vector3.zero
         hrp.Velocity = Vector3.zero
         hrp.RotVelocity = Vector3.zero
     else
-        PausedCharacterCFrame = nil
+        TASPause.PausedCharacterCFrame = nil
     end
 
     local cam = workspace.CurrentCamera
     if cam then
-        PausedCameraCFrame = cam.CFrame
-        PausedCameraType = cam.CameraType
+        TASPause.PausedCameraCFrame = cam.CFrame
+        TASPause.PausedCameraType = cam.CameraType
         cam.CameraType = Enum.CameraType.Scriptable
     else
-        PausedCameraCFrame = nil
-        PausedCameraType = nil
+        TASPause.PausedCameraCFrame = nil
+        TASPause.PausedCameraType = nil
     end
 
     pcall(function()
-        RunService:UnbindFromRenderStep(PausedCameraBindName)
-        RunService:BindToRenderStep(PausedCameraBindName, Enum.RenderPriority.Camera.Value + 10, function()
-            if not Paused or not Reading then return end
+        TASServices.RunService:UnbindFromRenderStep(TASPause.PausedCameraBindName)
+        TASServices.RunService:BindToRenderStep(TASPause.PausedCameraBindName, Enum.RenderPriority.Camera.Value + 10, function()
+            if not TASRuntime.Paused or not TASRuntime.Reading then return end
             local currentCam = workspace.CurrentCamera
-            if currentCam and PausedCameraCFrame then
+            if currentCam and TASPause.PausedCameraCFrame then
                 currentCam.CameraType = Enum.CameraType.Scriptable
-                currentCam.CFrame = PausedCameraCFrame
+                currentCam.CFrame = TASPause.PausedCameraCFrame
             end
         end)
     end)
 end
 
 local function HoldPlaybackPausedState()
-    if not Reading or not Paused then return end
+    if not TASRuntime.Reading or not TASRuntime.Paused then return end
 
-    if Character and Character:FindFirstChild("HumanoidRootPart") then
-        local hrp = Character.HumanoidRootPart
-        if PausedCharacterCFrame then
-            hrp.CFrame = PausedCharacterCFrame
+    if TASCharacter.Character and TASCharacter.Character:FindFirstChild("HumanoidRootPart") then
+        local hrp = TASCharacter.Character.HumanoidRootPart
+        if TASPause.PausedCharacterCFrame then
+            hrp.CFrame = TASPause.PausedCharacterCFrame
         end
         hrp.AssemblyLinearVelocity = Vector3.zero
         hrp.AssemblyAngularVelocity = Vector3.zero
         hrp.Velocity = Vector3.zero
         hrp.RotVelocity = Vector3.zero
-        if Humanoid then
-            Humanoid.PlatformStand = true
+        if TASCharacter.Humanoid then
+            TASCharacter.Humanoid.PlatformStand = true
         end
     end
 
     local cam = workspace.CurrentCamera
-    if cam and PausedCameraCFrame then
+    if cam and TASPause.PausedCameraCFrame then
         cam.CameraType = Enum.CameraType.Scriptable
-        cam.CFrame = PausedCameraCFrame
+        cam.CFrame = TASPause.PausedCameraCFrame
     end
 end
 
 local function EndPlaybackPause()
     pcall(function()
-        RunService:UnbindFromRenderStep(PausedCameraBindName)
+        TASServices.RunService:UnbindFromRenderStep(TASPause.PausedCameraBindName)
     end)
 
     local cam = workspace.CurrentCamera
-    if cam and PausedCameraType then
-        cam.CameraType = PausedCameraType
+    if cam and TASPause.PausedCameraType then
+        cam.CameraType = TASPause.PausedCameraType
     end
 
-    PausedCharacterCFrame = nil
-    PausedCameraCFrame = nil
-    PausedCameraType = nil
+    TASPause.PausedCharacterCFrame = nil
+    TASPause.PausedCameraCFrame = nil
+    TASPause.PausedCameraType = nil
 end
 
 
@@ -970,12 +966,12 @@ local function _tasKeyName(v)
 end
 
 -- ── Services ─────────────────────────────────────────────────────────────────
-do -- GUI scope: keep GUI construction locals out of the chunk register pool
-local TweenService = game:GetService("TweenService")
+local function __BuildGUI() -- GUI scope: isolate GUI locals in their own function
+TweenService = game:GetService("TweenService")
 
 -- ── Font ─────────────────────────────────────────────────────────────────────
-local UIFont = Font.fromEnum(Enum.Font.Code)
-local UIFontBold = Font.fromEnum(Enum.Font.GothamBold)
+UIFont = Font.fromEnum(Enum.Font.Code)
+UIFontBold = Font.fromEnum(Enum.Font.GothamBold)
 pcall(function()
     UIFont = Font.fromEnum(Enum.Font.GothamMedium)
     UIFontBold = Font.fromEnum(Enum.Font.GothamBold)
@@ -1000,9 +996,9 @@ end
 --  THEME SYSTEM
 -- ══════════════════════════════════════════════════════════════════════════════
 
-local ThemeBindings = {} -- {inst, property, themeKey}
+ThemeBindings = {} -- {inst, property, themeKey}
 
-local Theme = {
+Theme = {
     -- Layered backgrounds (deep → surface)
     bg_deep     = Color3.fromRGB(10, 10, 14),
     bg_window   = Color3.fromRGB(15, 15, 21),
@@ -1033,7 +1029,7 @@ local Theme = {
     yellow = Color3.fromRGB(220, 200, 60),
 }
 
-local ThemePresets = {
+ThemePresets = {
     ["Midnight Blue"] = {
         accent = Color3.fromRGB(100, 175, 255), accent_dim = Color3.fromRGB(30, 60, 100),
         accent_glow = Color3.fromRGB(75, 145, 225),
@@ -1112,8 +1108,8 @@ function setThemePreset(name)
     refreshAllTheme()
 end
 
-local StatsHudEnabled = false
-local StatsHudGui = nil
+StatsHudEnabled = false
+StatsHudGui = nil
  
 function createStatsHud()
     if StatsHudGui then StatsHudGui:Destroy() end
@@ -1123,7 +1119,7 @@ function createStatsHud()
     gui.ResetOnSpawn = false
     gui.DisplayOrder = 9998
     gui.IgnoreGuiInset = true
-    gui.Parent = Player.PlayerGui
+    gui.Parent = TASServices.Player.PlayerGui
  
     -- Main frame
     local frame = Instance.new("Frame")
@@ -1309,30 +1305,30 @@ function createStatsHud()
  
     -- ── Update loop ──────────────────────────────────────────────
     local hudAccumulator = 0
-    local updateConn = RunService.RenderStepped:Connect(function(dt)
+    local updateConn = TASServices.RunService.RenderStepped:Connect(function(dt)
         if not StatsHudEnabled or not StatsHudGui then return end
-        if not RootPart or not Humanoid then return end
+        if not TASCharacter.RootPart or not TASCharacter.Humanoid then return end
         hudAccumulator = hudAccumulator + (dt or 0)
         if hudAccumulator < (1 / 15) then return end
         hudAccumulator = 0
  
-        local pos = RootPart.Position
+        local pos = TASCharacter.RootPart.Position
         posX.Text = string.format("X: <font color='#ff8080'>%.4f</font>", pos.X)
         posY.Text = string.format("Y: <font color='#80ff80'>%.4f</font>", pos.Y)
         posZ.Text = string.format("Z: <font color='#8080ff'>%.4f</font>", pos.Z)
  
-        local vel = RootPart.Velocity
+        local vel = TASCharacter.RootPart.Velocity
         velX.Text   = string.format("X: <font color='#ff8080'>%.4f</font>", vel.X)
         velY.Text   = string.format("Y: <font color='#80ff80'>%.4f</font>", vel.Y)
         velZ.Text   = string.format("Z: <font color='#8080ff'>%.4f</font>", vel.Z)
         velMag.Text = string.format("Magnitude: <font color='#ffdc50'>%.4f</font>", vel.Magnitude)
  
-        local rx, ry, rz = RootPart.CFrame:ToOrientation()
+        local rx, ry, rz = TASCharacter.RootPart.CFrame:ToOrientation()
         rotX.Text = string.format("Pitch: <font color='#ff8080'>%.2f°</font>", math.deg(rx))
         rotY.Text = string.format("Yaw:   <font color='#80ff80'>%.2f°</font>", math.deg(ry))
         rotZ.Text = string.format("Roll:  <font color='#8080ff'>%.2f°</font>", math.deg(rz))
  
-        local stateStr = tostring(Humanoid:GetState()):gsub("Enum.HumanoidStateType.", "")
+        local stateStr = tostring(TASCharacter.Humanoid:GetState()):gsub("Enum.HumanoidStateType.", "")
         local sc = "#ffffff"
         if stateStr == "Jumping" or stateStr == "Freefall" then sc = "#80ff80"
         elseif stateStr == "Running" then sc = "#ffdc50"
@@ -1340,27 +1336,27 @@ function createStatsHud()
         elseif stateStr == "Dead" then sc = "#ff5050" end
         stateLabel.Text = string.format("State: <font color='%s'>%s</font>", sc, stateStr)
  
-        local floorMat = tostring(Humanoid.FloorMaterial):gsub("Enum.Material.", "")
+        local floorMat = tostring(TASCharacter.Humanoid.FloorMaterial):gsub("Enum.Material.", "")
         floorLabel.Text = string.format("Floor: <font color='#aaaaff'>%s</font>", floorMat)
-        jumpLabel.Text  = string.format("JumpPower: <font color='#c8c8ff'>%.1f</font>", Humanoid.JumpPower)
-        wsLabel.Text    = string.format("WalkSpeed: <font color='#c8c8ff'>%.1f</font>", Humanoid.WalkSpeed)
+        jumpLabel.Text  = string.format("JumpPower: <font color='#c8c8ff'>%.1f</font>", TASCharacter.Humanoid.JumpPower)
+        wsLabel.Text    = string.format("WalkSpeed: <font color='#c8c8ff'>%.1f</font>", TASCharacter.Humanoid.WalkSpeed)
         gravLabel.Text  = string.format("Gravity: <font color='#c8c8ff'>%.2f</font>", workspace.Gravity)
  
-        local totalFrames = #ReplayTable
-        local cf = Frozen and RoundNumber(FreezeFrame, 0) or (Reading and ReplayTableIndex or 0)
+        local totalFrames = #TASRuntime.ReplayTable
+        local cf = TASFreeze.Frozen and TASUtilityFunctions.RoundNumber(TASFreeze.FreezeFrame, 0) or (TASRuntime.Reading and TASRuntime.ReplayTableIndex or 0)
         frameLabel.Text = string.format("Frame: <font color='#64afff'>%d / %d</font>", cf, totalFrames)
-        timeLabel.Text  = string.format("Time:  <font color='#64afff'>%.2fs</font>", cf / math.max(ReplaySourceFPS or TASRecordingFPS or 1, 1))
+        timeLabel.Text  = string.format("Time:  <font color='#64afff'>%.2fs</font>", cf / math.max(TASRuntime.ReplaySourceFPS or TASConfig.TASRecordingFPS or 1, 1))
  
-        local zoom = GetZoom()
+        local zoom = TASFunctions.GetZoom()
         zoomLabel.Text = string.format("Zoom:  <font color='#64afff'>%.2f</font>", zoom)
  
         -- CSync info
         local partCount = (CO and CO.GetPartCount) and CO.GetPartCount() or 0
         coPartLabel.Text = string.format("Tracked: <font color='#64afff'>%d</font> parts", partCount)
         local coStatus = "idle"
-        if Writing then coStatus = "recording"
-        elseif Reading then coStatus = "playing"
-        elseif Frozen then coStatus = "frozen" end
+        if TASRuntime.Writing then coStatus = "recording"
+        elseif TASRuntime.Reading then coStatus = "playing"
+        elseif TASFreeze.Frozen then coStatus = "frozen" end
         coFrameLabel.Text = string.format("CO State: <font color='#64afff'>%s</font>", coStatus)
     end)
  
@@ -1375,7 +1371,7 @@ function createStatsHud()
     end
 
     StatsHudGui = gui
-    ConsoleMessage("Stats HUD enabled")
+    TASCharacter.ConsoleMessage("Stats HUD enabled")
 end
  
 function destroyStatsHud()
@@ -1395,10 +1391,12 @@ function destroyStatsHud()
         StatsHudGui:Destroy()
         StatsHudGui = nil
     end
-    ConsoleMessage("Stats HUD disabled")
+    TASCharacter.ConsoleMessage("Stats HUD disabled")
 end
--- Persistent user settings. Stored per-place so different games keep separate configs.
-local TasSettingsPath = FolderPath .. "\\Settings.json"
+-- Global user settings shared across all places. Replay files remain per-place.
+TASSettingsRootFolder = "Tasability"
+TasSettingsPath = TASSettingsRootFolder .. "\\Settings.json"
+TASLegacySettingsPath = TASPaths.FolderPath .. "\\Settings.json"
 TasSettings = rawget(_G, "TasSettings") or {}
 _G.TasSettings = TasSettings
 
@@ -1419,10 +1417,26 @@ function _tasApplySavedThemeAccent(cfg)
 end
 
 function LoadTasSettings()
-    if not isfile(TasSettingsPath) then return {} end
-    local ok, raw = pcall(readfile, TasSettingsPath)
+    local sourcePath = TasSettingsPath
+    if not isfile(sourcePath) and isfile(TASLegacySettingsPath) then
+        -- One-time migration from the old per-place Settings.json into the
+        -- global Tasability\Settings.json location.
+        sourcePath = TASLegacySettingsPath
+        pcall(function()
+            local legacyRaw = readfile(TASLegacySettingsPath)
+            if type(legacyRaw) == "string" and legacyRaw ~= "" then
+                if not isfolder(TASSettingsRootFolder) then
+                    makefolder(TASSettingsRootFolder)
+                end
+                writefile(TasSettingsPath, legacyRaw)
+            end
+        end)
+        sourcePath = TasSettingsPath
+    end
+    if not isfile(sourcePath) then return {} end
+    local ok, raw = pcall(readfile, sourcePath)
     if not ok or type(raw) ~= "string" or raw == "" then return {} end
-    local ok2, data = pcall(function() return HttpService:JSONDecode(raw) end)
+    local ok2, data = pcall(function() return TASServices.HttpService:JSONDecode(raw) end)
     if ok2 and type(data) == "table" then
         return data
     end
@@ -1434,8 +1448,11 @@ function SaveTasSettings()
     cfg.Version = 1
     cfg.ThemePreset = cfg.ThemePreset or "Midnight Blue"
     cfg.AccentHex = string.format("#%02X%02X%02X", math.floor(Theme.accent.R*255+0.5), math.floor(Theme.accent.G*255+0.5), math.floor(Theme.accent.B*255+0.5))
-    cfg.FPS = tonumber(FPS) or 120
-    cfg.TASRecordingFPS = tonumber(TASRecordingFPS) or 60
+    cfg.FPS = tonumber(TASConfig.FPS) or 120
+    cfg.TASRecordingFPS = tonumber(TASConfig.TASRecordingFPS) or 60
+    cfg.TAS = cfg.TAS or {}
+    cfg.TAS.AllowClientObjectManipulation = TASConfig.AllowClientObjectManipulation ~= false
+    cfg.TAS.CORecordingRadius = math.max(0, tonumber(TASConfig.CORecordingRadius) or 250)
     cfg.KeyboardTheme = currentTheme or "Default"
     cfg.Window = cfg.Window or {}
     cfg.Window.XScale = MainFrame and MainFrame.Position.X.Scale or 0.5
@@ -1462,13 +1479,18 @@ function SaveTasSettings()
     if DisableLighting then cfg.Checkboxes.DisableLighting = DisableLighting.Value end
     if MotionBlurToggle then cfg.Checkboxes.MotionBlur = MotionBlurToggle.Value end
     if movecameraonfroze then cfg.Checkboxes.MoveCameraFrozen = movecameraonfroze.Value end
-    local ok = pcall(function()
-        if not isfolder(FolderPath) then
-            makefolder(FolderPath)
+    local ok, err = pcall(function()
+        if not isfolder(TASSettingsRootFolder) then
+            makefolder(TASSettingsRootFolder)
         end
-        writefile(TasSettingsPath, HttpService:JSONEncode(cfg))
+        writefile(TasSettingsPath, TASServices.HttpService:JSONEncode(cfg))
     end)
-    if ok then TasSettings = cfg; _G.TasSettings = cfg end
+    if ok then
+        TasSettings = cfg
+        _G.TasSettings = cfg
+    else
+        TASCharacter.ConsoleMessage("Settings save failed: " .. tostring(err))
+    end
 end
 
 function QueueSaveTasSettings()
@@ -1478,9 +1500,114 @@ end
 TasSettings = LoadTasSettings()
 TasSettings = type(TasSettings) == "table" and TasSettings or {}
 _G.TasSettings = TasSettings
-if tonumber(TasSettings.FPS) then FPS = math.max(1, math.min(1000, tonumber(TasSettings.FPS))) end
-if tonumber(TasSettings.TASRecordingFPS) then TASRecordingFPS = math.max(1, math.min(1000, tonumber(TasSettings.TASRecordingFPS))) end
+if tonumber(TasSettings.FPS) then TASConfig.FPS = math.max(1, math.min(1000, tonumber(TasSettings.FPS))) end
+if tonumber(TasSettings.TASRecordingFPS) then TASConfig.TASRecordingFPS = math.max(1, math.min(1000, tonumber(TasSettings.TASRecordingFPS))) end
+if type(TasSettings.TAS) == "table" then
+    if TasSettings.TAS.AllowClientObjectManipulation ~= nil then
+        TASConfig.AllowClientObjectManipulation = TasSettings.TAS.AllowClientObjectManipulation == true
+    end
+    if tonumber(TasSettings.TAS.CORecordingRadius) then
+        TASConfig.CORecordingRadius = math.max(0, tonumber(TasSettings.TAS.CORecordingRadius))
+    end
+end
 _tasApplySavedThemeAccent(TasSettings)
+
+local TAS_DISCORD_INVITE_URL = "https://discord.gg/hJGAvDXmjj"
+_G.__TasabilityOpenDiscordInviteInBrowser = function(invite)
+    invite = tostring(invite or TAS_DISCORD_INVITE_URL)
+    local inviteCode = invite:match("discord%.gg/([^%s/?#]+)") or invite:match("/([^/?#]+)$") or invite
+
+    -- IMPORTANT: this executor exposes request/http_request as globals, not necessarily as raw _G fields.
+    local requestFn = request or http_request or (http and http.request)
+    if type(requestFn) ~= "function" then
+        return false, "no supported HTTP request API (request/http_request/http.request)"
+    end
+
+    -- Resolve the invite first, just like the known-working Discord inviter implementation.
+    local okData, inviteResponse = pcall(function()
+        return requestFn({
+            Url = "https://ptb.discord.com/api/invites/" .. tostring(inviteCode),
+            Method = "GET",
+        })
+    end)
+    if not okData then
+        return false, "invite GET threw: " .. tostring(inviteResponse)
+    end
+    if type(inviteResponse) ~= "table" then
+        return false, "invite GET returned " .. typeof(inviteResponse)
+    end
+
+    local inviteStatus = tonumber(inviteResponse.StatusCode or inviteResponse.Status)
+    local inviteBody = inviteResponse.Body
+    if inviteStatus and inviteStatus < 200 or inviteStatus and inviteStatus >= 300 then
+        local body = type(inviteBody) == "string" and inviteBody:sub(1, 300) or tostring(inviteBody)
+        return false, "invite GET status " .. tostring(inviteStatus) .. " | " .. body
+    end
+    if type(inviteBody) ~= "string" or inviteBody == "" then
+        return false, "invite GET returned no body"
+    end
+
+    local okJson, inviteData = pcall(function()
+        return TASServices.HttpService:JSONDecode(inviteBody)
+    end)
+    if not okJson or type(inviteData) ~= "table" or type(inviteData.code) ~= "string" or inviteData.code == "" then
+        return false, "invalid Discord invite response"
+    end
+
+    -- Ask the locally installed Discord desktop client to open the resolved invite.
+    local okRpc, rpcResponse = pcall(function()
+        return requestFn({
+            Url = "http://127.0.0.1:6463/rpc?v=1",
+            Method = "POST",
+            Headers = {
+                ["Content-Type"] = "application/json",
+                ["origin"] = "https://ptb.discord.com",
+            },
+            Body = TASServices.HttpService:JSONEncode({
+                cmd = "INVITE_BROWSER",
+                args = {
+                    code = inviteData.code,
+                    sex = "?species=Goblin&realm=Toril",
+                },
+                nonce = TASServices.HttpService:GenerateGUID(false),
+            }),
+        })
+    end)
+    if not okRpc then
+        return false, "Discord RPC threw: " .. tostring(rpcResponse)
+    end
+    if type(rpcResponse) ~= "table" then
+        return false, "Discord RPC returned " .. typeof(rpcResponse)
+    end
+
+    local rpcStatus = tonumber(rpcResponse.StatusCode or rpcResponse.Status)
+    local rpcBody = type(rpcResponse.Body) == "string" and rpcResponse.Body or ""
+    if rpcStatus and rpcStatus < 200 or rpcStatus and rpcStatus >= 300 then
+        return false, "Discord RPC status " .. tostring(rpcStatus) .. " | " .. rpcBody:sub(1, 300)
+    end
+
+    return true, "Discord RPC accepted invite " .. tostring(inviteData.code)
+end
+
+_G.__TasabilityMaybeOpenDiscordOnFirstLaunch = function()
+    TasSettings = TasSettings or {}
+    if TasSettings.DiscordFirstLaunchOpened == true then return end
+    task.defer(function()
+        local opener = _G.__TasabilityOpenDiscordInviteInBrowser
+        local opened, reason = false, "opener unavailable"
+        if type(opener) == "function" then
+            opened, reason = opener(TAS_DISCORD_INVITE_URL)
+        end
+        if opened == true then
+            TasSettings.DiscordFirstLaunchOpened = true
+            _G.TasSettings = TasSettings
+            pcall(SaveTasSettings)
+            TASCharacter.ConsoleMessage("Discord invite opened: " .. TAS_DISCORD_INVITE_URL)
+        else
+            TASCharacter.ConsoleMessage("Could not open Discord automatically: " .. tostring(reason or "unknown error") .. " | Use: invite")
+        end
+    end)
+end
 
 -- ── Instance helpers ─────────────────────────────────────────────────────────
 
@@ -1561,7 +1688,7 @@ end
 --  ROOT GUI
 -- ══════════════════════════════════════════════════════════════════════════════
 
-local RootGui = mk("ScreenGui", {
+RootGui = mk("ScreenGui", {
     Name = "TasabilityGUI",
     ResetOnSpawn = false,
     ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
@@ -1571,7 +1698,7 @@ local RootGui = mk("ScreenGui", {
 })
 
 -- Dedicated topmost layer for dropdown lists. It sits above popups/windows/overlays.
-local DropdownGui = mk("ScreenGui", {
+DropdownGui = mk("ScreenGui", {
     Name = "TasabilityDropdowns",
     ResetOnSpawn = false,
     ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
@@ -1596,7 +1723,7 @@ MainFrame = mk("Frame", {
 applyTheme(MainFrame, "BackgroundColor3", "bg_window")
 
 -- Accent outer stroke 
-local accentBorder = mk("UIStroke", {
+accentBorder = mk("UIStroke", {
     Parent = MainFrame,
     ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
     LineJoinMode = Enum.LineJoinMode.Miter,
@@ -1609,7 +1736,7 @@ applyTheme(accentBorder, "Color", "accent")
 addAccentLine(MainFrame, UDim2.new(0, 0, 0, 0), UDim2.new(1, 0, 0, 2))
 
 -- ── Title bar ────────────────────────────────────────────────────────────────
-local TitleBar = mk("Frame", {
+TitleBar = mk("Frame", {
     Size = UDim2.new(1, 0, 0, 28),
     Position = UDim2.fromOffset(0, 2),
     BackgroundColor3 = Theme.bg_deep,
@@ -1647,7 +1774,7 @@ do
         end
     end)
 
-    UserInputService.InputChanged:Connect(function(inp)
+    TASServices.UserInputService.InputChanged:Connect(function(inp)
         if not dragging or inp.UserInputType ~= Enum.UserInputType.MouseMovement then
             return
         end
@@ -1668,7 +1795,7 @@ do
 end
 
 -- Title label
-local TitleLabel = mk("TextLabel", {
+TitleLabel = mk("TextLabel", {
     Size = UDim2.fromOffset(78, 28),
     Position = UDim2.fromOffset(8, 0),
     BackgroundTransparency = 1,
@@ -1683,13 +1810,13 @@ applyTheme(TitleLabel, "TextColor3", "accent")
 addTextShadow(TitleLabel)
 
 -- Version label: styled chip/badge matching the reference screenshot.
-local VersionLabel = mk("TextButton", {
+VersionLabel = mk("TextButton", {
     Size = UDim2.fromOffset(52, 16),
     Position = UDim2.new(0, 100, 0.5, -8),
     BackgroundColor3 = Theme.bg_panel,
     BorderSizePixel = 2,
     BorderColor3 = Theme.border,
-    Text = tostring(Version):gsub("%-TAS5$", ""),
+    Text = tostring(TASConfig.Version):gsub("%-TAS5$", ""),
     TextColor3 = Theme.txt_muted,
     FontFace = UIFont,
     TextSize = 9,
@@ -1701,7 +1828,7 @@ applyTheme(VersionLabel, "BorderColor3", "border")
 addStroke(VersionLabel, "outline", 1)
 
 -- Minimize button
-local HideBtn = mk("TextButton", {
+HideBtn = mk("TextButton", {
     Size = UDim2.fromOffset(22, 16),
     Position = UDim2.new(1, -28, 0.5, -8),
     BackgroundColor3 = Theme.bg_element,
@@ -1722,8 +1849,6 @@ HideBtn.MouseEnter:Connect(function() tw(HideBtn, {TextColor3 = Theme.accent}) e
 HideBtn.MouseLeave:Connect(function() tw(HideBtn, {TextColor3 = Theme.txt_muted}) end)
 
 -- ── Side window toggles (reference-style layout) ───────────────────────────
-local PlayersPanel
-local FilesPanel
 PlayersPanelVisible = true
 FilesPanelVisible = true
 
@@ -1749,11 +1874,11 @@ function addTitleToggle(parent, text, x)
     return b
 end
 
-local PlayersToggle = addTitleToggle(TitleBar, "PLAYERS", 170)
-local FilesToggle = addTitleToggle(TitleBar, "FILES", 234)
+PlayersToggle = addTitleToggle(TitleBar, "PLAYERS", 170)
+FilesToggle = addTitleToggle(TitleBar, "FILES", 234)
 
 -- Reference-style search/status controls in the title bar.
-local SearchBox = mk("TextBox", {
+SearchBox = mk("TextBox", {
     Size = UDim2.fromOffset(190, 18),
     Position = UDim2.new(1, -332, 0, 5),
     BackgroundColor3 = Theme.bg_element,
@@ -1987,7 +2112,7 @@ function buildFilesPanel()
         BackgroundColor3 = Theme.bg_deep,
         BorderSizePixel = 2,
         BorderColor3 = Theme.border,
-        Text = "Current: " .. tostring(ReplayPath),
+        Text = "Current: " .. tostring(TASPaths.ReplayPath),
         TextColor3 = Theme.accent,
         FontFace = UIFont,
         TextSize = 10,
@@ -2031,7 +2156,7 @@ function buildFilesPanel()
         Parent = list,
     })
 
-    local ok, files = pcall(function() return listfiles(FolderPath) end)
+    local ok, files = pcall(function() return listfiles(TASPaths.FolderPath) end)
     files = ok and files or {}
     table.sort(files, function(a, b)
         return tostring(a):lower() < tostring(b):lower()
@@ -2041,7 +2166,7 @@ function buildFilesPanel()
     for _, path in ipairs(files) do
         local fileName = tostring(path):gsub('^.*[\\/]', '')
         local lowerName = fileName:lower()
-        if lowerName:sub(-5) == ".json" or lowerName:sub(-4) == ".tas" then
+        if lowerName ~= "settings.json" and (lowerName:sub(-5) == ".json" or lowerName:sub(-4) == ".tas") then
             replayFileCount += 1
             local btn = mk("TextButton", {
                 Size = UDim2.new(1, 0, 0, 22),
@@ -2077,8 +2202,8 @@ function buildFilesPanel()
                 tw(btnLbl, {TextColor3 = Theme.txt})
             end)
             btn.MouseButton1Click:Connect(function()
-                ReplayPath = path
-                ReplayNeedsReload = true
+                TASPaths.ReplayPath = path
+                TASPaths.ReplayNeedsReload = true
                 CurrentFile.Text = "Current File: " .. fileName
                 current.Text = "Current: " .. tostring(path)
             end)
@@ -2117,29 +2242,29 @@ function buildFilesPanel()
 
     local cols = {
         {"Load", function()
-            if ReplayPath and isfile(ReplayPath) then
-                local ok2, raw = pcall(readfile, ReplayPath)
+            if TASPaths.ReplayPath and isfile(TASPaths.ReplayPath) then
+                local ok2, raw = pcall(readfile, TASPaths.ReplayPath)
                 if ok2 and raw then
                     local decoded, replayFPS = ReplayDecode(raw)
                     if decoded then
-                        ReplayTable = decoded
-                        ReplaySaveState.Version = ReplaySaveState.Version + 1
-                        ReplaySaveState.Encoded = raw
-                        ReplaySaveState.EncodedVersion = ReplaySaveState.Version
-                        ReplaySourceFPS = math.max(1, tonumber(replayFPS or TASRecordingFPS) or 1)
-                        ActiveReplayFPS = ReplaySourceFPS
-                        ReplayNeedsReload = false
-                        LastLoadedPath = ReplayPath
-                        ConsoleMessage("Loaded: " .. tostring(ReplayPath))
+                        TASRuntime.ReplayTable = decoded
+                        TASRuntime.ReplaySaveState.Version = TASRuntime.ReplaySaveState.Version + 1
+                        TASRuntime.ReplaySaveState.Encoded = raw
+                        TASRuntime.ReplaySaveState.EncodedVersion = TASRuntime.ReplaySaveState.Version
+                        TASRuntime.ReplaySourceFPS = math.max(1, tonumber(replayFPS or TASConfig.TASRecordingFPS) or 1)
+                        TASRuntime.ActiveReplayFPS = TASRuntime.ReplaySourceFPS
+                        TASPaths.ReplayNeedsReload = false
+                        TASPaths.LastLoadedPath = TASPaths.ReplayPath
+                        TASCharacter.ConsoleMessage("Loaded: " .. tostring(TASPaths.ReplayPath))
                     end
                 end
             end
         end},
         {"Save",    function() SaveToFile() end},
         {"Delete",  function()
-            if ReplayPath and isfile(ReplayPath) then
-                pcall(delfile, ReplayPath)
-                ReplayNeedsReload = true
+            if TASPaths.ReplayPath and isfile(TASPaths.ReplayPath) then
+                pcall(delfile, TASPaths.ReplayPath)
+                TASPaths.ReplayNeedsReload = true
             end
             buildFilesPanel()
         end},
@@ -2187,25 +2312,25 @@ function buildFilesPanel()
     local function createReplayFile()
         local name = tostring(createBox.Text or "")
         name = name:gsub("^%s+", ""):gsub("%s+$", "")
-        if name == "" then ConsoleMessage("Enter a file name"); return end
+        if name == "" then TASCharacter.ConsoleMessage("Enter a file name"); return end
         name = name:gsub('[\\/:*?"<>|]', "_")
         if not name:lower():match("%.json$") then name = name .. ".json" end
-        if not isfolder(FolderPath) then pcall(makefolder, FolderPath) end
-        local path = FolderPath .. "\\" .. name
-        if isfile(path) then ConsoleMessage("File already exists: " .. name); return end
-        local emptyReplay = '{"Format":"TASABILITY_JSON3","Version":3,"FPS":' .. tostring(math.max(1, tonumber(TASRecordingFPS) or 1)) .. ',"Compression":"TAS4","Binary":"base64","RawBytes":0,"PackedBytes":0,"Frames":0,"Data":""}'
+        if not isfolder(TASPaths.FolderPath) then pcall(makefolder, TASPaths.FolderPath) end
+        local path = TASPaths.FolderPath .. "\\" .. name
+        if isfile(path) then TASCharacter.ConsoleMessage("File already exists: " .. name); return end
+        local emptyReplay = '{"Format":"TASABILITY_JSON3","Version":3,"FPS":' .. tostring(math.max(1, tonumber(TASConfig.TASRecordingFPS) or 1)) .. ',"Compression":"TAS4","Binary":"base64","RawBytes":0,"PackedBytes":0,"Frames":0,"Data":""}'
         local okWrite, err = pcall(writefile, path, emptyReplay)
         if okWrite then
-            ReplayPath = path
-            ReplayNeedsReload = true
-            LastLoadedPath = nil
+            TASPaths.ReplayPath = path
+            TASPaths.ReplayNeedsReload = true
+            TASPaths.LastLoadedPath = nil
             CurrentFile.Text = "Current File: " .. name
             current.Text = "Current: " .. path
             createBox.Text = ""
             buildFilesPanel()
-            ConsoleMessage("Created: " .. path)
+            TASCharacter.ConsoleMessage("Created: " .. path)
         else
-            ConsoleMessage("Create failed: " .. tostring(err))
+            TASCharacter.ConsoleMessage("Create failed: " .. tostring(err))
         end
     end
     createBtn.MouseButton1Click:Connect(createReplayFile)
@@ -2222,13 +2347,264 @@ function buildFilesPanel()
     })
     mk("UIListLayout", {FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4), Parent = extra})
 
-    makeBtn(extra, "Copy Path",     UDim2.new(0.5, -2, 0, 22), function() if setclipboard then setclipboard(tostring(ReplayPath)) end end)
-    makeBtn(extra, "Erase Current", UDim2.new(0.5, -2, 0, 22), function() ResetCurrentRecording(); buildFilesPanel() end)
+    makeBtn(extra, "Copy Path",     UDim2.new(0.5, -2, 0, 22), function() if setclipboard then setclipboard(tostring(TASPaths.ReplayPath)) end end)
+    makeBtn(extra, "Erase Current", UDim2.new(0.5, -2, 0, 22), function() TASFunctions.ResetCurrentRecording(); buildFilesPanel() end)
+end
+
+TASPlayerViewerRuntime = TASPlayerViewerRuntime or {
+    Selected = nil,
+    PreviewModel = nil,
+    PreviewTrack = nil,
+    PreviewAnimationId = "",
+    PreviewSourceCharacter = nil,
+    PreviewSourceRoot = nil,
+    PreviewPartPairs = {},
+    UpdateToken = 0,
+}
+
+function TASPlayerViewerColorHex(c)
+    c = c or Theme.txt
+    return string.format("#%02X%02X%02X", math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5))
+end
+
+function TASPlayerViewerDestroyPreview()
+    local rt = TASPlayerViewerRuntime
+    rt.PreviewAnimationId = ""
+    rt.PreviewSourceCharacter = nil
+    rt.PreviewSourceRoot = nil
+    rt.PreviewPartPairs = {}
+    if rt.PreviewTrack then
+        pcall(function()
+            rt.PreviewTrack:Stop(0)
+            rt.PreviewTrack:Destroy()
+        end)
+        rt.PreviewTrack = nil
+    end
+    if rt.PreviewModel then
+        pcall(function() rt.PreviewModel:Destroy() end)
+        rt.PreviewModel = nil
+    end
+end
+
+function TASPlayerViewerPruneThemeBindings(root)
+    local alive = {}
+    for _, binding in ipairs(ThemeBindings) do
+        local inst = binding[1]
+        local belongsToRoot = false
+        if inst and inst.Parent and inst ~= root then
+            local cursor = inst
+            while cursor and cursor ~= root do
+                cursor = cursor.Parent
+            end
+            belongsToRoot = cursor == root
+        end
+        if not belongsToRoot then
+            alive[#alive + 1] = binding
+        end
+    end
+    ThemeBindings = alive
+end
+
+function TASPlayerViewerGetBestTrack(humanoid)
+    if not humanoid then return nil end
+    local animator = humanoid:FindFirstChildOfClass("Animator")
+    if not animator then return nil end
+
+    local best = nil
+    local bestPriority = -math.huge
+    local bestWeight = -math.huge
+    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+        local weight = tonumber(track.WeightCurrent) or 0
+        -- A TAS-freezed local character intentionally has its animation speed
+        -- set to 0.  Such a track can still be the authoritative animation
+        -- state even though Roblox may report it as not actively advancing.
+        -- Prefer it when it is still loaded and has a valid Animation object.
+        local hasAnimation = track.Animation ~= nil
+        local isUsable = (track.IsPlaying and weight > 0.001) or (hasAnimation and track.IsPlaying == true)
+        if isUsable then
+            local priority = (track.Priority and tonumber(track.Priority.Value)) or 0
+            if priority > bestPriority or (priority == bestPriority and weight > bestWeight) then
+                best = track
+                bestPriority = priority
+                bestWeight = weight
+            end
+        end
+    end
+
+    -- During TAS freeze the selected local track is explicitly held at speed 0.
+    -- Prefer the TAS track over a stale/default Roblox track in that case.
+    if humanoid == TASCharacter.Humanoid and TASFreeze.Frozen and TASAnimation.currentAnimTrack then
+        local t = TASAnimation.currentAnimTrack
+        if t.Parent and t.Animation then
+            best = t
+        end
+    end
+    return best
+end
+
+function TASPlayerViewerGetRelativePath(inst, root)
+    local parts = {}
+    local cursor = inst
+    while cursor and cursor ~= root do
+        table.insert(parts, 1, cursor.Name)
+        cursor = cursor.Parent
+    end
+    return table.concat(parts, "/")
+end
+
+function TASPlayerViewerFindRelative(root, path)
+    local current = root
+    for partName in string.gmatch(path, "[^/]+") do
+        current = current and current:FindFirstChild(partName)
+        if not current then return nil end
+    end
+    return current
+end
+
+function TASPlayerViewerBuildPreview(plr, viewport, camera)
+    TASPlayerViewerDestroyPreview()
+    if not plr then return end
+
+    local char = plr.Character
+    if not char or not char.Parent then
+        viewport.CurrentCamera = camera
+        return
+    end
+
+    local sourceRoot = char:FindFirstChild("HumanoidRootPart")
+    if not sourceRoot then
+        viewport.CurrentCamera = camera
+        return
+    end
+
+    local oldArchivable = char.Archivable
+    char.Archivable = true
+    local ok, clone = pcall(function() return char:Clone() end)
+    char.Archivable = oldArchivable
+    if not ok or not clone then
+        return
+    end
+
+    -- The preview is a lightweight pose mirror, not a second live Roblox rig.
+    -- Removing joints lets us copy the source part CFrames at a low cadence
+    -- without running a second animation/physics simulation.
+    for _, obj in ipairs(clone:GetDescendants()) do
+        if obj:IsA("Script") or obj:IsA("LocalScript") or obj:IsA("ModuleScript") then
+            obj:Destroy()
+        elseif obj:IsA("Motor6D") or obj:IsA("Weld") or obj:IsA("WeldConstraint") or obj:IsA("ManualWeld") then
+            obj:Destroy()
+        elseif obj:IsA("BasePart") then
+            obj.Anchored = true
+            obj.CanCollide = false
+            obj.CanTouch = false
+            obj.CanQuery = false
+            obj.Massless = true
+        end
+    end
+
+    local humanoid = clone:FindFirstChildOfClass("Humanoid")
+    if humanoid then
+        humanoid.AutoRotate = false
+        humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+        if not humanoid:FindFirstChildOfClass("Animator") then
+            Instance.new("Animator", humanoid)
+        end
+    end
+
+    local worldModel = viewport:FindFirstChildOfClass("WorldModel")
+    if not worldModel then
+        worldModel = Instance.new("WorldModel")
+        worldModel.Name = "PreviewWorld"
+        worldModel.Parent = viewport
+    else
+        worldModel:ClearAllChildren()
+    end
+    clone.Parent = worldModel
+
+    local cloneRoot = clone:FindFirstChild("HumanoidRootPart")
+    if not cloneRoot then
+        clone:Destroy()
+        return
+    end
+
+    -- Keep the rig centred in the mini-camera.
+    local boundsCFrame, boundsSize = clone:GetBoundingBox()
+    local target = Vector3.new(0, math.max(boundsSize.Y * 0.47, 0.5), 0)
+    local move = target - boundsCFrame.Position
+    clone:PivotTo(CFrame.new(move) * clone:GetPivot())
+    cloneRoot = clone:FindFirstChild("HumanoidRootPart") or cloneRoot
+
+    local maxSize = math.max(boundsSize.X, boundsSize.Y, boundsSize.Z, 1)
+    local distance = maxSize * 1.85
+    local cameraOffset = Vector3.new(distance * 0.72, maxSize * 0.12, distance)
+    camera.FieldOfView = 35
+    camera.CFrame = CFrame.lookAt(target + cameraOffset, target)
+    viewport.CurrentCamera = camera
+
+    -- Build a stable source->preview part map once.
+    local pairs = {}
+    for _, src in ipairs(char:GetDescendants()) do
+        if src:IsA("BasePart") then
+            local relative = TASPlayerViewerGetRelativePath(src, char)
+            local dst = TASPlayerViewerFindRelative(clone, relative)
+            if dst and dst:IsA("BasePart") then
+                pairs[#pairs + 1] = {src, dst}
+            end
+        end
+    end
+
+    TASPlayerViewerRuntime.PreviewModel = clone
+    TASPlayerViewerRuntime.PreviewSourceCharacter = char
+    TASPlayerViewerRuntime.PreviewSourceRoot = sourceRoot
+    TASPlayerViewerRuntime.PreviewPartPairs = pairs
+    TASPlayerViewerRuntime.PreviewTargetRootCFrame = cloneRoot.CFrame
+end
+
+function TASPlayerViewerSyncPreviewPose()
+    local rt = TASPlayerViewerRuntime
+    local sourceChar = rt.PreviewSourceCharacter
+    local sourceRoot = rt.PreviewSourceRoot
+    local clone = rt.PreviewModel
+    if not sourceChar or not sourceChar.Parent or not sourceRoot or not sourceRoot.Parent or not clone or not clone.Parent then
+        return false
+    end
+
+    local cloneRoot = clone:FindFirstChild("HumanoidRootPart")
+    if not cloneRoot then return false end
+
+    local targetRootCFrame = rt.PreviewTargetRootCFrame or cloneRoot.CFrame
+    cloneRoot.CFrame = targetRootCFrame
+
+    for _, pair in ipairs(rt.PreviewPartPairs or {}) do
+        local src, dst = pair[1], pair[2]
+        if src and src.Parent and dst and dst.Parent then
+            local ok, relative = pcall(function()
+                return sourceRoot.CFrame:ToObjectSpace(src.CFrame)
+            end)
+            if ok and relative then
+                dst.CFrame = targetRootCFrame * relative
+                dst.Transparency = src.Transparency
+            end
+        end
+    end
+    return true
 end
 
 function buildPlayersPanel()
     clearChildrenExceptLayouts(_G_TAS_PlayersBody)
     local body = _G_TAS_PlayersBody
+    local rt = TASPlayerViewerRuntime
+    rt.UpdateToken = (rt.UpdateToken or 0) + 1
+    local updateToken = rt.UpdateToken
+
+    -- The reference viewer is a fixed-size 488x441 side window. Keep the
+    -- body static so the preview and state panes line up exactly instead of
+    -- becoming a vertically scrolling form.
+    body.AutomaticCanvasSize = Enum.AutomaticSize.None
+    body.CanvasSize = UDim2.fromOffset(0, 0)
+    body.ScrollBarThickness = 0
+
+    TASPlayerViewerPruneThemeBindings(body)
 
     local search = mk("TextBox", {
         Position = UDim2.fromOffset(0, 0),
@@ -2246,93 +2622,264 @@ function buildPlayersPanel()
         ClearTextOnFocus = false,
         Parent = body,
     })
-    applyTheme(search,"BackgroundColor3","bg_deep")
-    applyTheme(search,"BorderColor3","border")
-    addStroke(search,"outline",1)
+    applyTheme(search, "BackgroundColor3", "bg_deep")
+    applyTheme(search, "BorderColor3", "border")
+    addStroke(search, "outline", 1)
+    mk("UIPadding", {PaddingLeft = UDim.new(0, 7), Parent = search})
 
     local list = mk("ScrollingFrame", {
         Position = UDim2.fromOffset(0, 30),
-        Size = UDim2.new(0,150,1,-30),
+        Size = UDim2.new(0, 150, 1, -30),
         BackgroundColor3 = Theme.bg_deep,
         BorderSizePixel = 2,
         BorderColor3 = Theme.border,
         ScrollBarThickness = 2,
         ScrollBarImageColor3 = Theme.accent_dim,
-        CanvasSize = UDim2.fromScale(0,0),
+        CanvasSize = UDim2.fromScale(0, 0),
         AutomaticCanvasSize = Enum.AutomaticSize.Y,
-        Parent = body
+        ClipsDescendants = true,
+        Parent = body,
     })
-    applyTheme(list,"BackgroundColor3","bg_deep")
-    applyTheme(list,"BorderColor3","border")
-    addStroke(list,"outline",1)
+    applyTheme(list, "BackgroundColor3", "bg_deep")
+    applyTheme(list, "BorderColor3", "border")
+    applyTheme(list, "ScrollBarImageColor3", "accent_dim")
+    addStroke(list, "outline", 1)
+    mk("UIPadding", {
+        PaddingTop = UDim.new(0, 3),
+        PaddingBottom = UDim.new(0, 3),
+        PaddingLeft = UDim.new(0, 4),
+        PaddingRight = UDim.new(0, 4),
+        Parent = list,
+    })
     mk("UIListLayout", {
-        FillDirection=Enum.FillDirection.Vertical,
-        SortOrder=Enum.SortOrder.LayoutOrder,
-        Padding=UDim.new(0,1),
-        Parent=list
+        FillDirection = Enum.FillDirection.Vertical,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Padding = UDim.new(0, 1),
+        Parent = list,
     })
+
+    local previewTitle = mk("TextLabel", {
+        Position = UDim2.fromOffset(158, 0),
+        Size = UDim2.new(1, -158, 0, 18),
+        BackgroundTransparency = 1,
+        Text = "PREVIEW",
+        TextColor3 = Theme.accent,
+        FontFace = UIFontBold,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = body,
+    })
+    applyTheme(previewTitle, "TextColor3", "accent")
+    addTextShadow(previewTitle)
+
+    local viewport = mk("ViewportFrame", {
+        Position = UDim2.fromOffset(158, 22),
+        Size = UDim2.new(1, -158, 0, 160),
+        BackgroundColor3 = Theme.bg_deep,
+        BorderSizePixel = 2,
+        BorderColor3 = Theme.border,
+        Ambient = Color3.fromRGB(180, 180, 180),
+        LightColor = Color3.fromRGB(255, 255, 255),
+        LightDirection = Vector3.new(-1, -1, -1),
+        Parent = body,
+    })
+    applyTheme(viewport, "BackgroundColor3", "bg_deep")
+    applyTheme(viewport, "BorderColor3", "border")
+    addStroke(viewport, "outline", 1)
+
+    local camera = Instance.new("Camera")
+    camera.Name = "PreviewCamera"
+    camera.Parent = viewport
+    viewport.CurrentCamera = camera
+
+    local worldModel = Instance.new("WorldModel")
+    worldModel.Name = "PreviewWorld"
+    worldModel.Parent = viewport
+
+    local stateTitle = mk("TextLabel", {
+        Position = UDim2.fromOffset(158, 190),
+        Size = UDim2.new(1, -158, 0, 18),
+        BackgroundTransparency = 1,
+        Text = "STATE",
+        TextColor3 = Theme.accent,
+        FontFace = UIFontBold,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = body,
+    })
+    applyTheme(stateTitle, "TextColor3", "accent")
+    addTextShadow(stateTitle)
 
     local info = mk("TextLabel", {
-        Position=UDim2.fromOffset(158,0),
-        Size=UDim2.new(1,-158,1,0),
-        BackgroundColor3=Theme.bg_deep,
-        BorderSizePixel=2,
-        BorderColor3=Theme.border,
-        Text="Select a player",
-        TextColor3=Theme.txt_muted,
-        FontFace=UIFont,
-        TextSize=9,
-        TextXAlignment=Enum.TextXAlignment.Left,
-        TextYAlignment=Enum.TextYAlignment.Top,
-        TextWrapped=true,
-        Parent=body
+        Position = UDim2.fromOffset(158, 212),
+        Size = UDim2.new(1, -158, 1, -212),
+        BackgroundColor3 = Theme.bg_deep,
+        BorderSizePixel = 2,
+        BorderColor3 = Theme.border,
+        Text = "Select a player",
+        TextColor3 = Theme.txt,
+        FontFace = UIFont,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top,
+        TextWrapped = true,
+        RichText = true,
+        Parent = body,
     })
-    applyTheme(info,"BackgroundColor3","bg_deep")
-    applyTheme(info,"BorderColor3","border")
-    addStroke(info,"outline",1)
+    applyTheme(info, "BackgroundColor3", "bg_deep")
+    applyTheme(info, "BorderColor3", "border")
+    applyTheme(info, "TextColor3", "txt")
+    addStroke(info, "outline", 1)
+    mk("UIPadding", {
+        PaddingTop = UDim.new(0, 10),
+        PaddingBottom = UDim.new(0, 8),
+        PaddingLeft = UDim.new(0, 10),
+        PaddingRight = UDim.new(0, 8),
+        Parent = info,
+    })
 
-    local function showPlayer(plr)
+    local buttons = {}
+    local selectedButton = nil
+
+    local function setButtonVisual(item, selected)
+        if not item or not item.btn or not item.btn.Parent then return end
+        item.selected = selected == true
+        if item.selected then
+            item.btn.BackgroundTransparency = 0
+            item.btn.BackgroundColor3 = Theme.bg_panel
+            item.btn.TextColor3 = Theme.accent
+        else
+            item.btn.BackgroundTransparency = 1
+            item.btn.TextColor3 = Theme.txt_muted
+        end
+    end
+
+    local function selectPlayer(plr)
         if not plr or not plr.Parent then return end
+        rt.Selected = plr
+        if selectedButton and selectedButton ~= plr then
+            local old = nil
+            for _, item in ipairs(buttons) do
+                if item.plr == selectedButton then old = item break end
+            end
+            setButtonVisual(old, false)
+        end
+        selectedButton = plr
+        for _, item in ipairs(buttons) do
+            if item.plr == plr then
+                setButtonVisual(item, true)
+                break
+            end
+        end
+        TASPlayerViewerBuildPreview(plr, viewport, camera)
+    end
+
+    local function buildPlayerState(plr)
+        if not plr or not plr.Parent then
+            return "Select a player"
+        end
+
         local char = plr.Character
         local hum = char and char:FindFirstChildOfClass("Humanoid")
         local root = char and char:FindFirstChild("HumanoidRootPart")
         local pos = root and root.Position
-        info.Text = string.format(
-            "Name: %s\nDisplay: %s\nUserId: %d\n\nState: %s\nHealth: %.1f / %.1f\nWalkSpeed: %.1f\nJumpPower: %.1f\nPosition: %s",
-            plr.Name, plr.DisplayName, plr.UserId,
-            hum and hum:GetState().Name or "N/A",
-            hum and hum.Health or 0, hum and hum.MaxHealth or 0,
-            hum and hum.WalkSpeed or 0, hum and hum.JumpPower or 0,
-            pos and string.format("%.2f, %.2f, %.2f", pos.X,pos.Y,pos.Z) or "N/A"
+        local vel = root and root.AssemblyLinearVelocity
+        local stateStr = hum and hum:GetState().Name or "N/A"
+        local floor = hum and tostring(hum.FloorMaterial):gsub("Enum.Material.", "") or "N/A"
+        local animTrack = TASPlayerViewerGetBestTrack(hum)
+        local animName = animTrack and ((animTrack.Name ~= "" and animTrack.Name ~= "Animation") and animTrack.Name or ((animTrack.Animation and animTrack.Animation.Name ~= "") and animTrack.Animation.Name or "Playing")) or ((plr == TASServices.Player and TASAnimation.currentAnimName ~= "" and TASAnimation.currentAnimName) or "idle")
+        local animId = animTrack and animTrack.Animation and tostring(animTrack.Animation.AnimationId or "") or ""
+        if animId == "" and plr == TASServices.Player and TASAnimation.currentAnimTrack and TASAnimation.currentAnimTrack.Animation then
+            animId = tostring(TASAnimation.currentAnimTrack.Animation.AnimationId or "")
+        end
+        local team = plr.Team and plr.Team.Name or "None"
+        local teamColor = plr.TeamColor and plr.TeamColor.Color or Theme.accent
+        local velocity = vel or Vector3.zero
+        local position = pos or Vector3.zero
+        local animSpeed = animTrack and tonumber(animTrack.Speed) or ((plr == TASServices.Player and tonumber(TASAnimation.currentAnimSpeed)) or 1)
+        local animText = animId ~= "" and (animName .. " (" .. animId .. ")") or animName
+
+        return string.format(
+            "Name: %s\nDisplay: %s\nUserId: %d\n\nState: <font color='%s'>%s</font>\nHealth: <font color='%s'>%.1f / %.1f</font>\nWalkSpeed: <font color='%s'>%.1f</font>\nJumpPower: <font color='%s'>%.1f</font>\nPosition: %.1f, %.1f, %.1f\nVelocity: %.1f  (%.1f, %.1f, %.1f)\nAnimation: <font color='%s'>%s</font>\nAnim Speed: <font color='%s'>%.2f</font>\nFloor: <font color='%s'>%s</font>\nTeam: <font color='%s'>%s</font>",
+            plr.Name,
+            plr.DisplayName,
+            plr.UserId,
+            TASPlayerViewerColorHex((stateStr == "Dead" and Theme.red) or Theme.yellow), stateStr,
+            TASPlayerViewerColorHex(Theme.green), hum and hum.Health or 0, hum and hum.MaxHealth or 0,
+            TASPlayerViewerColorHex(Theme.green), hum and hum.WalkSpeed or 0,
+            TASPlayerViewerColorHex(Theme.green), hum and hum.JumpPower or 0,
+            position.X, position.Y, position.Z,
+            velocity.Magnitude, velocity.X, velocity.Y, velocity.Z,
+            TASPlayerViewerColorHex(Theme.accent), animText,
+            TASPlayerViewerColorHex(Theme.accent), animSpeed,
+            TASPlayerViewerColorHex(Theme.txt_muted), floor,
+            TASPlayerViewerColorHex(teamColor), team
         )
     end
 
-    local buttons = {}
-    for _, plr in ipairs(game:GetService("Players"):GetPlayers()) do
+    local function syncPreviewAnimation(plr)
+        local char = plr and plr.Character
+        if not char or not char.Parent then
+            TASPlayerViewerDestroyPreview()
+            return
+        end
+        if rt.PreviewModel and rt.PreviewSourceCharacter ~= char then
+            TASPlayerViewerBuildPreview(plr, viewport, camera)
+        end
+        -- The mini-camera intentionally updates its pose at a low cadence
+        -- (see the 0.125s accumulator below) to keep the main game cheap.
+        TASPlayerViewerSyncPreviewPose()
+    end
+
+    local function addPlayerButton(plr)
         local btn = mk("TextButton", {
-            Size=UDim2.new(1,-4,0,22),
-            BackgroundTransparency=1,
-            BorderSizePixel=0,
-            Text="  "..plr.Name,
-            TextColor3=Theme.txt_muted,
-            FontFace=UIFont,
-            TextSize=9,
-            TextXAlignment=Enum.TextXAlignment.Left,
-            AutoButtonColor=false,
-            Parent=list
+            Size = UDim2.new(1, 0, 0, 22),
+            BackgroundColor3 = Theme.bg_inline,
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            Text = "  " .. plr.Name,
+            TextColor3 = Theme.txt_muted,
+            FontFace = UIFont,
+            TextSize = 9,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            AutoButtonColor = false,
+            Parent = list,
         })
-        buttons[#buttons+1] = {plr=plr, btn=btn}
+        applyTheme(btn, "BackgroundColor3", "bg_inline")
+        applyTheme(btn, "TextColor3", "txt_muted")
+        local stroke = addStroke(btn, "outline", 0.5, 0.75)
+        local item = {plr = plr, btn = btn, stroke = stroke, selected = false}
+        buttons[#buttons + 1] = item
+
         btn.MouseEnter:Connect(function()
-            btn.BackgroundTransparency=0.8
-            tw(btn,{TextColor3=Theme.accent})
+            if not item.selected then
+                btn.BackgroundTransparency = 0
+                btn.BackgroundColor3 = Theme.bg_hover
+            end
+            tw(btn, {TextColor3 = Theme.accent})
         end)
         btn.MouseLeave:Connect(function()
-            btn.BackgroundTransparency=1
-            tw(btn,{TextColor3=Theme.txt_muted})
+            if item.selected then
+                btn.BackgroundTransparency = 0
+                btn.BackgroundColor3 = Theme.bg_panel
+                btn.TextColor3 = Theme.accent
+            else
+                btn.BackgroundTransparency = 1
+                btn.TextColor3 = Theme.txt_muted
+            end
         end)
         btn.MouseButton1Click:Connect(function()
-            showPlayer(plr)
+            selectPlayer(plr)
         end)
+        return item
+    end
+
+    local players = game:GetService("Players"):GetPlayers()
+    table.sort(players, function(a, b)
+        return tostring(a.Name):lower() < tostring(b.Name):lower()
+    end)
+    for _, plr in ipairs(players) do
+        addPlayerButton(plr)
     end
 
     local function refreshPlayerFilter()
@@ -2344,6 +2891,60 @@ function buildPlayersPanel()
         end
     end
     search:GetPropertyChangedSignal("Text"):Connect(refreshPlayerFilter)
+
+    if rt.Selected and rt.Selected.Parent then
+        local exists = false
+        for _, item in ipairs(buttons) do
+            if item.plr == rt.Selected then exists = true break end
+        end
+        if exists then
+            selectedButton = rt.Selected
+            for _, item in ipairs(buttons) do
+                if item.plr == rt.Selected then setButtonVisual(item, true) end
+            end
+            TASPlayerViewerBuildPreview(rt.Selected, viewport, camera)
+        else
+            rt.Selected = nil
+        end
+    end
+
+    if not rt.Selected and players[1] then
+        selectPlayer(players[1])
+    end
+
+    task.spawn(function()
+        local previewAccumulator = 0
+        local stateAccumulator = 0
+        local lastStateText = nil
+        while TASPlayerViewerRuntime.UpdateToken == updateToken do
+            task.wait(0.05)
+            if TASPlayerViewerRuntime.UpdateToken ~= updateToken then break end
+            local selected = TASPlayerViewerRuntime.Selected
+            previewAccumulator += 0.05
+            stateAccumulator += 0.05
+
+            if selected and selected.Parent and PlayersPanel.Visible then
+                if previewAccumulator >= 0.125 then
+                    previewAccumulator = previewAccumulator - 0.125
+                    syncPreviewAnimation(selected) -- 8 FPS live mini-camera
+                end
+
+                if stateAccumulator >= 0.10 then
+                    stateAccumulator = 0
+                    local stateText = buildPlayerState(selected)
+                    if stateText ~= lastStateText then
+                        info.Text = stateText
+                        lastStateText = stateText
+                    end
+                end
+            elseif selected and not selected.Parent then
+                rt.Selected = nil
+                TASPlayerViewerDestroyPreview()
+                info.Text = "Select a player"
+                lastStateText = info.Text
+            end
+        end
+    end)
 end
 
 buildFilesPanel()
@@ -2395,7 +2996,7 @@ pcall(function()
 end)
 
 -- ── Inline frame ( style: window > inline > content) ─────────────────
-local InlineFrame = mk("Frame", {
+InlineFrame = mk("Frame", {
     Position = UDim2.fromOffset(7, 32),
     Size = UDim2.new(1, -14, 1, -39),
     BackgroundColor3 = Theme.bg_inline,
@@ -2406,7 +3007,7 @@ applyTheme(InlineFrame, "BackgroundColor3", "bg_inline")
 addLayeredBorder(InlineFrame)
 
 -- ── Tab bar (inside inline) ──────────────────────────────────────────────────
-local TabBar = mk("Frame", {
+TabBar = mk("Frame", {
     Position = UDim2.fromOffset(7, 7),
     Size = UDim2.new(1, -14, 0, 22),
     BackgroundTransparency = 1,
@@ -2422,7 +3023,7 @@ mk("UIListLayout", {
 })
 
 -- ── Content frame (inside inline, below tabs) ────────────────────────────────
-local ContentFrame = mk("Frame", {
+ContentFrame = mk("Frame", {
     Position = UDim2.fromOffset(7, 32),
     Size = UDim2.new(1, -14, 1, -39),
     BackgroundColor3 = Theme.bg_deep,
@@ -2436,10 +3037,10 @@ addLayeredBorder(ContentFrame)
 --  TAB SYSTEM
 -- ══════════════════════════════════════════════════════════════════════════════
 
-local tabPages = {}
-local tabButtons = {}  -- stores the button Instances
-local tabData = {}     -- stores {textLbl, hideBar} per tab name (separate from Instance)
-local activeTab = nil
+tabPages = {}
+tabButtons = {}  -- stores the button Instances
+tabData = {}     -- stores {textLbl, hideBar} per tab name (separate from Instance)
+activeTab = nil
 
 function switchTab(name)
     for n, pg in pairs(tabPages) do pg.Visible = (n == name) end
@@ -2766,7 +3367,7 @@ function addKeybind(parent, cfg, size)
         keyLbl.Text = "..."
         keyLbl.TextColor3 = Theme.yellow
         local conn
-        conn = UserInputService.InputBegan:Connect(function(inp)
+        conn = TASServices.UserInputService.InputBegan:Connect(function(inp)
             if inp.UserInputType == Enum.UserInputType.Keyboard then
                 shim.Value = inp.KeyCode
                 currentKey = inp.KeyCode
@@ -2864,12 +3465,22 @@ function addTextbox(parent, cfg)
         if cfg.Callback then cfg.Callback(box, box.Text) end
     end)
 
-    local shim = {Value = cfg.Value or ""}
+    local shim = {_Frame = wrap}
     setmetatable(shim, {
-        __index = function(_, k) if k == "Value" then return box.Text end end,
-        __newindex = function(_, k, v) if k == "Value" then box.Text = tostring(v) end end,
+        __index = function(_, k)
+            if k == "Value" then return box.Text end
+            return nil
+        end,
+        __newindex = function(_, k, v)
+            if k == "Value" then
+                box.Text = tostring(v)
+                return
+            end
+            rawset(shim, k, v)
+        end,
     })
     function shim:SetValue(v) box.Text = tostring(v) end
+    function shim:SetVisible(v) wrap.Visible = v == true end
     return shim
 end
 
@@ -2957,7 +3568,7 @@ function addCombo(parent, cfg)
             listFrame.Visible = true
         else listFrame.Visible = false end
     end)
-    UserInputService.InputBegan:Connect(function(inp)
+    TASServices.UserInputService.InputBegan:Connect(function(inp)
         if inp.UserInputType == Enum.UserInputType.MouseButton1 and open then
             task.wait()
             local mx, my = inp.Position.X, inp.Position.Y
@@ -2983,24 +3594,30 @@ function makeConsole(parent)
         CanvasSize=UDim2.fromScale(0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y,
         Parent=frame,
     })
-    mk("UIPadding", {PaddingTop=UDim.new(0,4), PaddingBottom=UDim.new(0,4),
-        PaddingLeft=UDim.new(0,6), PaddingRight=UDim.new(0,6), Parent=sf})
-    mk("UIListLayout", {FillDirection=Enum.FillDirection.Vertical, SortOrder=Enum.SortOrder.LayoutOrder,
-        Padding=UDim.new(0,2), Parent=sf})
 
-    -- Prompt bar
+    mk("UIPadding", {
+        PaddingTop=UDim.new(0,4), PaddingBottom=UDim.new(0,4),
+        PaddingLeft=UDim.new(0,6), PaddingRight=UDim.new(0,6), Parent=sf
+    })
+    mk("UIListLayout", {
+        FillDirection=Enum.FillDirection.Vertical, SortOrder=Enum.SortOrder.LayoutOrder,
+        Padding=UDim.new(0,2), Parent=sf
+    })
+
     local promptBar = mk("Frame", {
         Size=UDim2.new(1,0,0,26), Position=UDim2.new(0,0,1,-26),
         BackgroundColor3=Theme.bg_inline, BorderSizePixel=0, Parent=frame,
     })
     applyTheme(promptBar, "BackgroundColor3", "bg_inline")
 
-    -- Top border
-    mk("Frame", {Size=UDim2.new(1,0,0,1), BackgroundColor3=Theme.outline, BorderSizePixel=0, Parent=promptBar})
-
-    -- Accent left edge
-    mk("Frame", {Size=UDim2.new(0,2,1,0), BackgroundColor3=Theme.accent, BorderSizePixel=0, Parent=promptBar})
-
+    mk("Frame", {
+        Size=UDim2.new(1,0,0,1), BackgroundColor3=Theme.outline,
+        BorderSizePixel=0, Parent=promptBar
+    })
+    mk("Frame", {
+        Size=UDim2.new(0,2,1,0), BackgroundColor3=Theme.accent,
+        BorderSizePixel=0, Parent=promptBar
+    })
     mk("TextLabel", {
         Size=UDim2.fromOffset(14,26), Position=UDim2.fromOffset(6,0),
         BackgroundTransparency=1, Text=">", TextColor3=Theme.accent_glow,
@@ -3016,38 +3633,67 @@ function makeConsole(parent)
         TextXAlignment=Enum.TextXAlignment.Left, ClearTextOnFocus=false,
         Parent=promptBar,
     })
-    mk("UIPadding", {PaddingLeft=UDim.new(0,4), PaddingRight=UDim.new(0,4), Parent=inputBox})
+    mk("UIPadding", {
+        PaddingLeft=UDim.new(0,4), PaddingRight=UDim.new(0,4), Parent=inputBox
+    })
 
     local consoleShim = {Callback = nil}
 
+    local function colorForMessage(msg)
+        local lo = msg:lower()
+        if lo:find("error", 1, true) or lo:find("fail", 1, true) or lo:find("warn", 1, true) then
+            return Theme.yellow
+        elseif lo:find("loaded", 1, true) or lo:find("saved", 1, true)
+            or lo:find("done", 1, true) or lo:find("ok", 1, true) then
+            return Theme.green
+        elseif lo:find("reading", 1, true) or lo:find("decod", 1, true)
+            or lo:find("encod", 1, true) then
+            return Theme.cyan
+        end
+        return Theme.txt_muted
+    end
+
+    function consoleShim:ClearLogs()
+        for _, child in ipairs(sf:GetChildren()) do
+            if child:IsA("TextBox") then
+                child:Destroy()
+            end
+        end
+        sf.CanvasPosition = Vector2.zero
+    end
+
     function consoleShim:AppendText(...)
         local parts = {}
-        for _, v in ipairs({...}) do parts[#parts+1] = tostring(v) end
+        for _, v in ipairs({...}) do
+            parts[#parts+1] = tostring(v)
+        end
         local msg = table.concat(parts, " ")
 
-        local lbl = mk("TextLabel", {
+        local line = mk("TextBox", {
             Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y,
-            BackgroundTransparency=1, Text=msg, RichText=false,
-            TextColor3=Theme.txt_muted, FontFace=UIFont, TextSize=11,
-            TextXAlignment=Enum.TextXAlignment.Left, TextWrapped=true, Parent=sf,
+            BackgroundTransparency=1, BorderSizePixel=0,
+            Text=msg, TextColor3=colorForMessage(msg),
+            FontFace=UIFont, TextSize=11,
+            TextXAlignment=Enum.TextXAlignment.Left,
+            TextYAlignment=Enum.TextYAlignment.Top,
+            TextWrapped=true,
+            MultiLine=true,
+            TextEditable=false,
+            ClearTextOnFocus=false,
+            Selectable=true,
+            RichText=false,
+            Parent=sf,
         })
-        local lo = msg:lower()
-        if lo:find("error") or lo:find("fail") or lo:find("warn") then
-            lbl.TextColor3 = Theme.yellow
-        elseif lo:find("loaded") or lo:find("saved") or lo:find("done") or lo:find("ok") then
-            lbl.TextColor3 = Theme.green
-        elseif lo:find("reading") or lo:find("decod") or lo:find("encod") then
-            lbl.TextColor3 = Theme.cyan
-        end
 
         task.defer(function()
-            sf.CanvasPosition = Vector2.new(0, sf.AbsoluteCanvasSize.Y)
+            sf.CanvasPosition = Vector2.new(0, math.max(0, sf.AbsoluteCanvasSize.Y - sf.AbsoluteSize.Y))
         end)
     end
 
     inputBox.FocusLost:Connect(function(enter)
         if enter and #inputBox.Text > 0 then
-            local txt = inputBox.Text; inputBox.Text = ""
+            local txt = inputBox.Text
+            inputBox.Text = ""
             if consoleShim.Callback then
                 local shimSelf = {Clear = function() inputBox.Text = "" end}
                 consoleShim.Callback(shimSelf, txt)
@@ -3057,9 +3703,14 @@ function makeConsole(parent)
 
     local inputShim = {}
     setmetatable(inputShim, {
-        __newindex = function(_, k, v) if k == "Callback" then consoleShim.Callback = v end end,
-        __index = function(_, k) if k == "Callback" then return consoleShim.Callback end end,
+        __newindex = function(_, k, v)
+            if k == "Callback" then consoleShim.Callback = v end
+        end,
+        __index = function(_, k)
+            if k == "Callback" then return consoleShim.Callback end
+        end
     })
+
     return consoleShim, inputShim
 end
 
@@ -3126,7 +3777,9 @@ visualsPage  = addTab("visuals")
 consolePage  = addTab("console")
 settingsPage = addTab("settings")
 
--- Controls page is a two-column dashboard rather than one long stack.
+-- Controls/secondary tab UI is built in a helper function so its temporary
+-- locals do not consume registers from the giant GUI setup chunk.
+local function __BuildRemainingGui()
 -- This keeps the main window close to the reference layout while preserving
 -- the existing element builders and callbacks.
 do
@@ -3184,27 +3837,24 @@ do
     WritingPressedKeysLabel = addLabel(infoSec, "Writing Pressed keys: |")
 
     do
-        local _cfLbl = mk("TextLabel", {
+        ColorCodeFrame = mk("TextLabel", {
             Size=UDim2.new(1,0,0,14), BackgroundTransparency=1,
             Text="Status: Idle", TextColor3=Theme.txt,
             FontFace=UIFontBold, TextSize=11, TextXAlignment=Enum.TextXAlignment.Left,
             Parent=infoSec,
         })
-        addTextShadow(_cfLbl)
-        ColorCodeFrame = _cfLbl
+        addTextShadow(ColorCodeFrame)
     end
 
     ConnectedLabel = addLabel(infoSec, "AHK folder not found")
 
     do
-        local _cpBtn = addButton(infoSec, "Place id: "..tostring(PlaceId), function()
-            if setclipboard then setclipboard(tostring(PlaceId)) end
+        CurrentPlaceIdButton = addButton(infoSec, "Place id: "..tostring(TASPaths.PlaceId), function()
+            if setclipboard then setclipboard(tostring(TASPaths.PlaceId)) end
         end)
-        CurrentPlaceIdButton = _cpBtn
     end
 
-    _currentFileLbl = addLabel(infoSec, "Current File: ")
-    CurrentFile = _currentFileLbl
+    CurrentFile = addLabel(infoSec, "Current File: ")
 
     -- ── CONTROLS ───────────────────────────────────────────────────────────────
     ctrlSec = addSection(leftColumn, "controls")
@@ -3217,7 +3867,7 @@ do
 
     IgnoreGameProcessedButton = addCheckbox(ctrlSec, {
         Label = "Ignore Game Processed", Default = false,
-        Callback = function(self) IgnoreGameProcessed = self.Value end,
+        Callback = function(self) TASRuntime.IgnoreGameProcessed = self.Value end,
     })
 
     KeyboardOverlayThemes = {
@@ -3269,7 +3919,7 @@ do
                 if not getgenv().KeyboardOverlayGui then
                     local overlayGui = Instance.new("ScreenGui")
                     overlayGui.Name="KeyboardOverlay"; overlayGui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
-                    overlayGui.ResetOnSpawn=false; overlayGui.DisplayOrder=9999; overlayGui.Parent=Player.PlayerGui
+                    overlayGui.ResetOnSpawn=false; overlayGui.DisplayOrder=9999; overlayGui.Parent=TASServices.Player.PlayerGui
                     local container = Instance.new("Frame")
                     container.Name="Container"; container.Size=KeyboardOverlayThemes[currentTheme].size
                     container.Position=UDim2.new(0,20,1,-container.Size.Y.Offset-20)
@@ -3296,7 +3946,7 @@ do
                 currentTheme = sel
                 TasSettings.KeyboardTheme = sel
                 QueueSaveTasSettings()
-                ConsoleMessage("Keyboard theme changed to: "..sel)
+                TASCharacter.ConsoleMessage("Keyboard theme changed to: "..sel)
             end
         end,
     })
@@ -3308,7 +3958,7 @@ do
     Readkeybind = ReadRow:Keybind({Label = "keybind", Value = Enum.KeyCode.Z})
 
     AbortRow = addRow(ctrlSec)
-    AbortRow:Button({Text = "Abort", Callback = function() StopReading(true) end})
+    AbortRow:Button({Text = "Abort", Callback = function() TASFunctions.StopReading(true) end})
     Abortkeybind = AbortRow:Keybind({Label = "keybind", Value = Enum.KeyCode.L})
 
     -- ── KEYBINDS ───────────────────────────────────────────────────────────────
@@ -3325,12 +3975,13 @@ do
     utilitySec = addSection(rightColumn, "utility")
 
     addButton(utilitySec, "Erase Recording", function()
-        ResetCurrentRecording()
+        TASFunctions.ResetCurrentRecording()
     end)
 
     addButton(utilitySec, "Rejoin", function()
-        ConsoleMessage("Rejoining...")
+        TASCharacter.ConsoleMessage("Rejoining...")
         SaveToFile()
+        while TASRuntime.Saving do TASServices.RunService.Heartbeat:Wait() end
         SaveTasSettings()
         task.wait(0.5)
         if #game.Players:GetPlayers() <= 1 then
@@ -3343,32 +3994,32 @@ do
     end)
 
     FPSTextbox = addTextbox(utilitySec, {
-        Label = "FPS Cap", Value = tostring(FPS), Placeholder = "Enter FPS...",
+        Label = "FPS Cap", Value = tostring(TASConfig.FPS), Placeholder = "Enter FPS...",
         Callback = function(_, value)
             local newFPS = tonumber(value)
             if newFPS and newFPS > 0 and newFPS <= 1000 then
-                FPS = newFPS
-                if setfpscap then pcall(setfpscap, FPS) end
-                TasSettings.FPS = FPS
+                TASConfig.FPS = newFPS
+                if setfpscap then pcall(setfpscap, TASConfig.FPS) end
+                TasSettings.FPS = TASConfig.FPS
                 QueueSaveTasSettings()
-                ConsoleMessage("FPS set to "..tostring(FPS))
+                TASCharacter.ConsoleMessage("FPS set to "..tostring(TASConfig.FPS))
             else
-                ConsoleMessage("Invalid FPS value")
+                TASCharacter.ConsoleMessage("Invalid FPS value")
             end
         end,
     })
 
     TASRecordingFPSTextbox = addTextbox(utilitySec, {
-        Label = "TAS FPS", Value = tostring(TASRecordingFPS), Placeholder = "Enter TAS FPS...",
+        Label = "TAS FPS", Value = tostring(TASConfig.TASRecordingFPS), Placeholder = "Enter TAS FPS...",
         Callback = function(_, value)
             local newFPS = tonumber(value)
             if newFPS and newFPS > 0 and newFPS <= 1000 then
-                TASRecordingFPS = newFPS
-                TasSettings.TASRecordingFPS = TASRecordingFPS
+                TASConfig.TASRecordingFPS = newFPS
+                TasSettings.TASRecordingFPS = TASConfig.TASRecordingFPS
                 QueueSaveTasSettings()
-                ConsoleMessage("TAS FPS set to "..tostring(TASRecordingFPS))
+                TASCharacter.ConsoleMessage("TAS FPS set to "..tostring(TASConfig.TASRecordingFPS))
             else
-                ConsoleMessage("Invalid TAS FPS value")
+                TASCharacter.ConsoleMessage("Invalid TAS FPS value")
             end
         end,
     })
@@ -3377,15 +4028,16 @@ do
     addButton(utilitySec, "Teleport", function()
         local placeId = tonumber(TeleportTextbox.Value)
         if placeId and placeId > 0 then
-            ConsoleMessage("Teleporting to: "..tostring(placeId))
+            TASCharacter.ConsoleMessage("Teleporting to: "..tostring(placeId))
             SaveToFile()
+            while TASRuntime.Saving do TASServices.RunService.Heartbeat:Wait() end
             SaveTasSettings()
             task.wait(0.5)
             pcall(function()
                 game:GetService("TeleportService"):Teleport(placeId, game.Players.LocalPlayer)
             end)
         else
-            ConsoleMessage("Invalid PlaceId")
+            TASCharacter.ConsoleMessage("Invalid PlaceId")
         end
     end)
 end
@@ -3405,21 +4057,21 @@ end
 
 function ApplyConfiguredPhysics(ignorePlaybackLock)
     local values = getPhysicsValues()
-    if Character then
-        local hum = Character:FindFirstChild("Humanoid")
-        local hrp = Character:FindFirstChild("HumanoidRootPart")
+    if TASCharacter.Character then
+        local hum = TASCharacter.Character:FindFirstChild("Humanoid")
+        local hrp = TASCharacter.Character:FindFirstChild("HumanoidRootPart")
         if hum then
             if values.WalkSpeed and (ignorePlaybackLock or not AllowChangingPhysics) then
                 hum.WalkSpeed = values.WalkSpeed
-                DefaultWalkSpeed = values.WalkSpeed
+                TASCharacter.DefaultWalkSpeed = values.WalkSpeed
             end
             if values.JumpPower and (ignorePlaybackLock or not AllowChangingPhysics) then
                 hum.JumpPower = values.JumpPower
-                DefaultJumpPower = values.JumpPower
+                TASCharacter.DefaultJumpPower = values.JumpPower
             end
         end
         if values.Gravity then
-            DefaultGravity = values.Gravity
+            TASCharacter.DefaultGravity = values.Gravity
             if ignorePlaybackLock or not AllowChangingPhysics then
                 workspace.Gravity = values.Gravity
             end
@@ -3431,7 +4083,7 @@ function ApplyConfiguredPhysics(ignorePlaybackLock)
 end
 
 function EnforcePlaybackPhysics()
-    if not Reading or AllowChangingPhysics then return end
+    if not TASRuntime.Reading or AllowChangingPhysics then return end
     ApplyConfiguredPhysics(false)
 end
 
@@ -3439,9 +4091,9 @@ WalkSpeedTextbox = addTextbox(physSec, {Label = "WalkSpeed", Value = "16", Place
     Callback = function(_, v)
         local n = tonumber(v)
         if n then
-            DefaultWalkSpeed = n
-            if Character and Character:FindFirstChild("Humanoid") and (not Reading or not AllowChangingPhysics) then
-                Character.Humanoid.WalkSpeed = n
+            TASCharacter.DefaultWalkSpeed = n
+            if TASCharacter.Character and TASCharacter.Character:FindFirstChild("Humanoid") and (not TASRuntime.Reading or not AllowChangingPhysics) then
+                TASCharacter.Character.Humanoid.WalkSpeed = n
             end
         end
     end})
@@ -3449,9 +4101,9 @@ JumpPowerTextbox = addTextbox(physSec, {Label = "JumpPower", Value = "50", Place
     Callback = function(_, v)
         local n = tonumber(v)
         if n then
-            DefaultJumpPower = n
-            if Character and Character:FindFirstChild("Humanoid") and (not Reading or not AllowChangingPhysics) then
-                Character.Humanoid.JumpPower = n
+            TASCharacter.DefaultJumpPower = n
+            if TASCharacter.Character and TASCharacter.Character:FindFirstChild("Humanoid") and (not TASRuntime.Reading or not AllowChangingPhysics) then
+                TASCharacter.Character.Humanoid.JumpPower = n
             end
         end
     end})
@@ -3459,8 +4111,8 @@ GravityTextbox = addTextbox(physSec, {Label = "Gravity", Value = "196.2", Placeh
     Callback = function(_, v)
         local n = tonumber(v)
         if n then
-            DefaultGravity = n
-            if not Reading or not AllowChangingPhysics then
+            TASCharacter.DefaultGravity = n
+            if not TASRuntime.Reading or not AllowChangingPhysics then
                 workspace.Gravity = n
             end
         end
@@ -3468,8 +4120,8 @@ GravityTextbox = addTextbox(physSec, {Label = "Gravity", Value = "196.2", Placeh
 FrictionTextbox = addTextbox(physSec, {Label = "Friction", Value = "0.3", Placeholder = "0.3",
     Callback = function(_, v)
         local n = tonumber(v)
-        if n and Character and Character:FindFirstChild("HumanoidRootPart") then
-            local hrp = Character.HumanoidRootPart
+        if n and TASCharacter.Character and TASCharacter.Character:FindFirstChild("HumanoidRootPart") then
+            local hrp = TASCharacter.Character.HumanoidRootPart
             local cur = hrp.CustomPhysicalProperties
             hrp.CustomPhysicalProperties = PhysicalProperties.new(cur and cur.Density or 0.7, n, cur and cur.Elasticity or 0.5, 1, 1)
         end
@@ -3477,8 +4129,8 @@ FrictionTextbox = addTextbox(physSec, {Label = "Friction", Value = "0.3", Placeh
 DensityTextbox = addTextbox(physSec, {Label = "Density", Value = "0.7", Placeholder = "0.7",
     Callback = function(_, v)
         local n = tonumber(v)
-        if n and Character and Character:FindFirstChild("HumanoidRootPart") then
-            local hrp = Character.HumanoidRootPart
+        if n and TASCharacter.Character and TASCharacter.Character:FindFirstChild("HumanoidRootPart") then
+            local hrp = TASCharacter.Character.HumanoidRootPart
             local cur = hrp.CustomPhysicalProperties
             hrp.CustomPhysicalProperties = PhysicalProperties.new(n, cur and cur.Friction or 0.3, cur and cur.Elasticity or 0.5, 1, 1)
         end
@@ -3493,20 +4145,20 @@ end})
 
 addButton(physSec, "Apply Physics", function()
     ApplyConfiguredPhysics(true)
-    ConsoleMessage("Physics applied")
+    TASCharacter.ConsoleMessage("Physics applied")
 end)
 
 addButton(physSec, "Reset Physics", function()
-    WalkSpeedTextbox:SetValue("16")
-    JumpPowerTextbox:SetValue("50")
-    GravityTextbox:SetValue("196.2")
-    FrictionTextbox:SetValue("0.3")
-    DensityTextbox:SetValue("0.7")
-    DefaultWalkSpeed = 16
-    DefaultJumpPower = 50
-    DefaultGravity = 196.2
+    WalkSpeedTextbox.Value = "16"
+    JumpPowerTextbox.Value = "50"
+    GravityTextbox.Value = "196.2"
+    FrictionTextbox.Value = "0.3"
+    DensityTextbox.Value = "0.7"
+    TASCharacter.DefaultWalkSpeed = 16
+    TASCharacter.DefaultJumpPower = 50
+    TASCharacter.DefaultGravity = 196.2
     ApplyConfiguredPhysics(true)
-    ConsoleMessage("Physics reset")
+    TASCharacter.ConsoleMessage("Physics reset")
 end)
 
 -- Visuals tab
@@ -3516,18 +4168,18 @@ addCheckbox(visSec, {Label = "Stats HUD", Default = false, Callback = function(s
     if StatsHudEnabled then createStatsHud() else destroyStatsHud() end
 end})
 addCheckbox(visSec, {Label = "Trajectory Tracer", Default = false, Callback = function(self)
-    TracerEnabled = self.Value
-    if not TracerEnabled then clearTracerLines() end
+    TASTracer.TracerEnabled = self.Value
+    if not TASTracer.TracerEnabled then clearTracerObjects() end
 end})
-addTextbox(visSec, {Label = "Tracer Lookahead (s)", Value = tostring(TRACER_LOOKAHEAD),
+addTextbox(visSec, {Label = "Tracer Lookahead (s)", Value = tostring(TASTracer.TRACER_LOOKAHEAD),
     Callback = function(_, v)
         local n = tonumber(v)
-        if n and n > 0 and n <= 5 then TRACER_LOOKAHEAD = n end
+        if n and n > 0 and n <= 5 then TASTracer.TRACER_LOOKAHEAD = n end
     end})
-addTextbox(visSec, {Label = "Tracer Steps", Value = tostring(TRACER_STEPS),
+addTextbox(visSec, {Label = "Tracer Steps", Value = tostring(TASTracer.TRACER_STEPS),
     Callback = function(_, v)
         local n = tonumber(v)
-        if n and n > 0 and n <= 100 then TRACER_STEPS = math.floor(n); clearTracerLines() end
+        if n and n > 0 and n <= 100 then TASTracer.TRACER_STEPS = math.floor(n); clearTracerObjects() end
     end})
 
 -- Optional visual toggles moved out of Controls so the main dashboard stays compact.
@@ -3589,6 +4241,50 @@ console, ConsoleInput = makeConsole(consoleTabFrame)
 
 -- ── SETTINGS TAB ─────────────────────────────────────────────────────────────
 -- File actions intentionally do NOT live here; they are handled by the Files panel.
+
+local tasSettingsSec = addSection(settingsPage, "TAS Settings")
+local CORecordingRadiusTextbox
+local allowClientObjectManipulation = addCheckbox(tasSettingsSec, {
+    Label = "Allow Client Object Manipulation",
+    Default = TASConfig.AllowClientObjectManipulation ~= false,
+    Callback = function(self)
+        TASConfig.AllowClientObjectManipulation = self.Value == true
+        if not TASConfig.AllowClientObjectManipulation then
+            pcall(function()
+                if CO and CO.ReleaseHeldState then CO.ReleaseHeldState() end
+                if CO and CO.Stop then CO.Stop() end
+                if CO then
+                    CO._initialized = false
+                    CO._recordingRequested = false
+                    CO._forceFullFrame = false
+                    CO._lerpTargets = {}
+                    CO._FullStateCache = nil
+                end
+            end)
+        elseif not TASRuntime.Reading and CO and CO.QueueInitialization then
+            pcall(CO.QueueInitialization)
+        end
+        if CORecordingRadiusTextbox then
+            CORecordingRadiusTextbox:SetVisible(TASConfig.AllowClientObjectManipulation)
+        end
+        QueueSaveTasSettings()
+    end,
+})
+
+CORecordingRadiusTextbox = addTextbox(tasSettingsSec, {
+    Label = "Set radius recording client objects (in studs)",
+    Value = tostring(TASConfig.CORecordingRadius),
+    Placeholder = "250",
+    Callback = function(_, v)
+        local n = tonumber(v)
+        if n and n >= 0 and n <= 10000 then
+            TASConfig.CORecordingRadius = n
+            QueueSaveTasSettings()
+        end
+    end,
+})
+CORecordingRadiusTextbox:SetVisible(TASConfig.AllowClientObjectManipulation ~= false)
+
 themeSec = addSection(settingsPage, "theme")
 
 addCombo(themeSec, {
@@ -3604,7 +4300,7 @@ addCombo(themeSec, {
             setThemePreset(presetName)
             TasSettings.ThemePreset = presetName
             QueueSaveTasSettings()
-            ConsoleMessage("Theme set to: "..presetName)
+            TASCharacter.ConsoleMessage("Theme set to: "..presetName)
         end
     end,
 })
@@ -3624,14 +4320,14 @@ addTextbox(themeSec, {
             refreshAllTheme()
             TasSettings.AccentHex = v
             QueueSaveTasSettings()
-            ConsoleMessage("Accent set to: "..v)
+            TASCharacter.ConsoleMessage("Accent set to: "..v)
         end
     end,
 })
 
 addButton(themeSec, "Save Settings", function()
     SaveTasSettings()
-    ConsoleMessage("Settings saved")
+    TASCharacter.ConsoleMessage("Settings saved")
 end)
 
 _G.__TasabilityWindowSec = addSection(settingsPage, "window")
@@ -3656,9 +4352,16 @@ addTextbox(_G.__TasabilityWindowSec, {
     end,
 })
 
-switchTab("controls")
+
+    switchTab("controls")
+end
+__BuildRemainingGui()
 
 end -- GUI scope
+__BuildGUI()
+if type(_G.__TasabilityMaybeOpenDiscordOnFirstLaunch) == "function" then
+    _G.__TasabilityMaybeOpenDiscordOnFirstLaunch()
+end
 
 -- ── Window shim ──────────────────────────────────────────────────────────────
 Window = {}
@@ -3668,17 +4371,20 @@ end
 
 -- ── Current file auto-update ─────────────────────────────────────────────────
 task.spawn(function()
-    repeat task.wait() until type(ReplayPath) == "string"
     local function getFileName(path)
+        if type(path) ~= "string" or path == "" then
+            return "No file selected"
+        end
         local parts = string.split(path, "\\")
         return parts[#parts] or path
     end
-    CurrentFile.Text = "Current File: "..getFileName(ReplayPath)
-    local old = ReplayPath
-    while task.wait() do
-        if ReplayPath ~= old then
-            CurrentFile.Text = "Current File: "..getFileName(ReplayPath)
-            old = ReplayPath
+
+    local old = false
+    while task.wait(0.25) do
+        local path = TASPaths.ReplayPath
+        if path ~= old then
+            CurrentFile.Text = "Current File: "..getFileName(path)
+            old = path
         end
     end
 end)
@@ -3690,12 +4396,12 @@ end)
 local SetColorCodeFrame
 local GetColorCodeFrame
 do
-    ConsoleMessage = function(...)
+    TASCharacter.ConsoleMessage = function(...)
         setthreadidentity(8)
         console:AppendText(...)
     end
 
-    ConsoleMessage("Tasability loading...")
+    TASCharacter.ConsoleMessage("Tasability loading...")
 
     SetColorCodeFrame = function(Name)
         -- Status UI must never be able to break recording/playback cleanup.
@@ -3703,12 +4409,12 @@ do
         -- after a previous playback, so treat HUD/status updates as best-effort.
         pcall(function()
             if ColorCodeFrame then
-                ColorCodeFrame.TextColor3 = ColorCodes[Name] or ColorCodes.None
-                ColorCodeFrame.Text = "Status: "..(ColorCodes[Name] and Name or "None")
+                ColorCodeFrame.TextColor3 = TASConfig.ColorCodes[Name] or TASConfig.ColorCodes.None
+                ColorCodeFrame.Text = "Status: "..(TASConfig.ColorCodes[Name] and Name or "None")
             end
             if StatusPill then
-                StatusPill.Text = "■ "..(ColorCodes[Name] and Name or "None")
-                StatusPill.TextColor3 = ColorCodes[Name] or Theme.txt_muted
+                StatusPill.Text = "■ "..(TASConfig.ColorCodes[Name] and Name or "None")
+                StatusPill.TextColor3 = TASConfig.ColorCodes[Name] or Theme.txt_muted
             end
         end)
     end
@@ -3813,7 +4519,7 @@ local PlayAnimation, setAnimationSpeed
 
 do
 	StopAllAnimations = function()
-		for _,v in pairs(Humanoid:GetPlayingAnimationTracks()) do 
+		for _,v in pairs(TASCharacter.Humanoid:GetPlayingAnimationTracks()) do 
 			v:Stop()
 		end
 	end
@@ -3849,17 +4555,17 @@ do
 					for _,Connection in pairs(getconnections(Animate.Changed)) do
 						Connection:Disconnect()
 					end
-					if BypassAntiExploit then
+					if TASConfig.BypassAntiExploit then
 						Animate.Disabled = true
 						if setparentinternal then
 							setparentinternal(Animate, game.Lighting)
 						else
-							ConsoleMessage("Your exploit does not support setparentinternal, expect animation glitches")
+							TASCharacter.ConsoleMessage("Your exploit does not support setparentinternal, expect animation glitches")
 						end
 					else
 						Animate:Destroy()
 					end
-					ConsoleMessage("Animate script found and disabled")
+					TASCharacter.ConsoleMessage("Animate script found and disabled")
 					break
 				end
 			end
@@ -3867,7 +4573,7 @@ do
 		
 	
 		if not animateFound then
-			ConsoleMessage("[WARNING] Animate script not found - animations will be handled manually")
+			TASCharacter.ConsoleMessage("[WARNING] Animate script not found - animations will be handled manually")
 		end
 		
 		StopAllAnimations()
@@ -3880,7 +4586,7 @@ do
 			local RightHip = Torso:WaitForChild("Right Hip")
 			local LeftHip = Torso:WaitForChild("Left Hip")
 			local Neck = Torso:WaitForChild("Neck")
-			local Humanoid = Figure:WaitForChild("Humanoid")
+			TASCharacter.Humanoid = Figure:WaitForChild("Humanoid")
 
 			local currentAnim = ""
 			local currentAnimInstance = nil
@@ -3975,7 +4681,7 @@ do
 				end
 			end
 
-			local animator = Humanoid and Humanoid:FindFirstChildOfClass("Animator") or nil
+			local animator = TASCharacter.Humanoid and TASCharacter.Humanoid:FindFirstChildOfClass("Animator") or nil
 			if animator then
 				local animTracks = animator:GetPlayingAnimationTracks()
 				for i,track in ipairs(animTracks) do
@@ -4002,6 +4708,7 @@ do
 					oldAnim = "idle"
 				end
 				currentAnim = ""
+				TASAnimation.currentAnimName = ""
 				currentAnimInstance = nil
 				if (currentAnimKeyframeHandler ~= nil) then
 					currentAnimKeyframeHandler:disconnect()
@@ -4011,13 +4718,15 @@ do
 					currentAnimTrack:Destroy()
 					currentAnimTrack = nil
 				end
+				TASAnimation.currentAnimTrack = nil
 				return oldAnim
 			end
 
 			setAnimationSpeed = function(speed)
-				if speed ~= currentAnimSpeed then
-					currentAnimSpeed = speed
-					currentAnimTrack:AdjustSpeed(currentAnimSpeed)
+				speed = tonumber(speed) or 0
+				TASAnimation.currentAnimSpeed = speed
+				if currentAnimTrack then
+					pcall(function() currentAnimTrack:AdjustSpeed(speed) end)
 				end
 			end
 
@@ -4027,21 +4736,21 @@ do
 					if (emoteNames[repeatAnim] ~= nil and emoteNames[repeatAnim] == false) then
 						repeatAnim = "idle"
 					end
-					local animSpeed = currentAnimSpeed
-					playAnimation(repeatAnim, 0.0, Humanoid)
+					local animSpeed = TASAnimation.currentAnimSpeed
+					playAnimation(repeatAnim, 0.0, TASCharacter.Humanoid)
 					setAnimationSpeed(animSpeed)
 				end
 			end
 
-			playAnimation = function(animName, transitionTime, humanoid, bypassAnimateDisabled) 
+			playAnimation = function(animName, transitionTime, humanoid, bypassAnimateDisabled, forceRestart) 
 				pcall(function()
-					if AnimateDisabled and not bypassAnimateDisabled then
+					if TASRuntime.AnimateDisabled and not bypassAnimateDisabled then
 						return
 					end
 					
-					local lastAnimation = AnimationQueue[#AnimationQueue]
+					local lastAnimation = TASRuntime.AnimationQueue[#TASRuntime.AnimationQueue]
 					if not lastAnimation or lastAnimation[1] ~= animName or lastAnimation[2] ~= transitionTime then
-						table.insert(AnimationQueue,{animName,transitionTime})
+						table.insert(TASRuntime.AnimationQueue,{animName,transitionTime})
 					end
 					
 					local roll = math.random(1, animTable[animName].totalWeight) 
@@ -4053,16 +4762,18 @@ do
 					end
 					local anim = animTable[animName][idx].anim
 
-					if (anim ~= currentAnimInstance) then
+					if (anim ~= currentAnimInstance) or forceRestart then
 						if (currentAnimTrack ~= nil) then
 							currentAnimTrack:Stop(transitionTime)
 							currentAnimTrack:Destroy()
 						end
-						currentAnimSpeed = 1.0
+						TASAnimation.currentAnimSpeed = 1.0
 						currentAnimTrack = humanoid:LoadAnimation(anim)
+						TASAnimation.currentAnimTrack = currentAnimTrack
 						currentAnimTrack.Priority = Enum.AnimationPriority.Core
 						currentAnimTrack:Play(transitionTime)
 						currentAnim = animName
+						TASAnimation.currentAnimName = animName
 						currentAnimInstance = anim
 						if (currentAnimKeyframeHandler ~= nil) then
 							currentAnimKeyframeHandler:disconnect()
@@ -4079,7 +4790,7 @@ do
 
 			function toolKeyFrameReachedFunc(frameName)
 				if (frameName == "End") then
-					playToolAnimation(toolAnimName, 0.0, Humanoid)
+					playToolAnimation(toolAnimName, 0.0, TASCharacter.Humanoid)
 				end
 			end
 
@@ -4126,63 +4837,63 @@ do
 
 			onRunning = function(speed)
 				if speed > 0.01 then
-					playAnimation("walk", 0.1, Humanoid)
+					playAnimation("walk", 0.1, TASCharacter.Humanoid)
 					if currentAnimInstance and currentAnimInstance.AnimationId == "http://www.roblox.com/asset/?id=180426354" then
 						setAnimationSpeed(speed / 14.5)
 					end
-					pose = "Running"
+					TASAnimation.pose = "Running"
 				else
 					if emoteNames[currentAnim] == nil then
-						playAnimation("idle", 0.1, Humanoid)
-						pose = "Standing"
+						playAnimation("idle", 0.1, TASCharacter.Humanoid)
+						TASAnimation.pose = "Standing"
 					end
 				end
 			end
 
 			onDied = function()
-				pose = "Dead"
+				TASAnimation.pose = "Dead"
 			end
 
 			onJumping = function()
-				playAnimation("jump", 0.1, Humanoid)
+				playAnimation("jump", 0.1, TASCharacter.Humanoid)
 				jumpAnimTime = jumpAnimDuration
-				pose = "Jumping"
+				TASAnimation.pose = "Jumping"
 			end
 
 			onClimbing = function(speed)
-				playAnimation("climb", 0.1, Humanoid)
+				playAnimation("climb", 0.1, TASCharacter.Humanoid)
 				setAnimationSpeed(speed / 12.0)
-				pose = "Climbing"
+				TASAnimation.pose = "Climbing"
 			end
 
 			onGettingUp = function()
-				pose = "GettingUp"
+				TASAnimation.pose = "GettingUp"
 			end
 
 			onFreeFall = function()
 				if (jumpAnimTime <= 0) then
-					playAnimation("fall", fallTransitionTime, Humanoid)
+					playAnimation("fall", fallTransitionTime, TASCharacter.Humanoid)
 				end
-				pose = "FreeFall"
+				TASAnimation.pose = "FreeFall"
 			end
 
 			onFallingDown = function()
-				pose = "FallingDown"
+				TASAnimation.pose = "FallingDown"
 			end
 
 			onSeated = function()
-				pose = "Seated"
+				TASAnimation.pose = "Seated"
 			end
 
 			onPlatformStanding = function()
-				pose = "PlatformStanding"
+				TASAnimation.pose = "PlatformStanding"
 			end
 
 			onSwimming = function(speed)
 				if speed > 0 then
-					pose = "Running"
+					TASAnimation.pose = "Running"
 				else
-					pose = "Standing"
+					TASAnimation.pose = "Standing"
 				end
 			end
 
@@ -4204,15 +4915,15 @@ do
 
 			function animateTool()
 				if (toolAnim == "None") then
-					playToolAnimation("toolnone", toolTransitionTime, Humanoid, Enum.AnimationPriority.Idle)
+					playToolAnimation("toolnone", toolTransitionTime, TASCharacter.Humanoid, Enum.AnimationPriority.Idle)
 					return
 				end
 				if (toolAnim == "Slash") then
-					playToolAnimation("toolslash", 0, Humanoid, Enum.AnimationPriority.Action)
+					playToolAnimation("toolslash", 0, TASCharacter.Humanoid, Enum.AnimationPriority.Action)
 					return
 				end
 				if (toolAnim == "Lunge") then
-					playToolAnimation("toollunge", 0, Humanoid, Enum.AnimationPriority.Action)
+					playToolAnimation("toollunge", 0, TASCharacter.Humanoid, Enum.AnimationPriority.Action)
 					return
 				end
 			end
@@ -4229,7 +4940,7 @@ do
 			local lastTick = 0
 
 			function move(time)
-				if AnimateDisabled then
+				if TASRuntime.AnimateDisabled then
 					return
 				end
 				
@@ -4244,14 +4955,14 @@ do
 					jumpAnimTime = jumpAnimTime - deltaTime
 				end
 
-				if (pose == "FreeFall" and jumpAnimTime <= 0) then
-					playAnimation("fall", fallTransitionTime, Humanoid)
-				elseif (pose == "Seated") then
-					playAnimation("sit", 0.5, Humanoid)
+				if (TASAnimation.pose == "FreeFall" and jumpAnimTime <= 0) then
+					playAnimation("fall", fallTransitionTime, TASCharacter.Humanoid)
+				elseif (TASAnimation.pose == "Seated") then
+					playAnimation("sit", 0.5, TASCharacter.Humanoid)
 					return
-				elseif (pose == "Running") then
-					playAnimation("walk", 0.1, Humanoid)
-				elseif (pose == "Dead" or pose == "GettingUp" or pose == "FallingDown" or pose == "Seated" or pose == "PlatformStanding") then
+				elseif (TASAnimation.pose == "Running") then
+					playAnimation("walk", 0.1, TASCharacter.Humanoid)
+				elseif (TASAnimation.pose == "Dead" or TASAnimation.pose == "GettingUp" or TASAnimation.pose == "FallingDown" or TASAnimation.pose == "Seated" or TASAnimation.pose == "PlatformStanding") then
 					stopAllAnimations()
 					amplitude = 0.1
 					frequency = 1
@@ -4288,18 +4999,18 @@ do
 			end
 
 			local function guarded(fn)
-				return function(...) if not AnimateDisabled then fn(...) end end
+				return function(...) if not TASRuntime.AnimateDisabled then fn(...) end end
 			end
-			Humanoid.Died:connect(guarded(onDied))
-			Humanoid.Running:connect(guarded(onRunning))
-			Humanoid.Jumping:connect(onJumping)
-			Humanoid.Climbing:connect(guarded(onClimbing))
-			Humanoid.GettingUp:connect(guarded(onGettingUp))
-			Humanoid.FreeFalling:connect(guarded(onFreeFall))
-			Humanoid.FallingDown:connect(guarded(onFallingDown))
-			Humanoid.Seated:connect(guarded(onSeated))
-			Humanoid.PlatformStanding:connect(guarded(onPlatformStanding))
-			Humanoid.Swimming:connect(guarded(onSwimming))
+			TASCharacter.Humanoid.Died:connect(guarded(onDied))
+			TASCharacter.Humanoid.Running:connect(guarded(onRunning))
+			TASCharacter.Humanoid.Jumping:connect(onJumping)
+			TASCharacter.Humanoid.Climbing:connect(guarded(onClimbing))
+			TASCharacter.Humanoid.GettingUp:connect(guarded(onGettingUp))
+			TASCharacter.Humanoid.FreeFalling:connect(guarded(onFreeFall))
+			TASCharacter.Humanoid.FallingDown:connect(guarded(onFallingDown))
+			TASCharacter.Humanoid.Seated:connect(guarded(onSeated))
+			TASCharacter.Humanoid.PlatformStanding:connect(guarded(onPlatformStanding))
+			TASCharacter.Humanoid.Swimming:connect(guarded(onSwimming))
 
 			game:GetService("Players").LocalPlayer.Chatted:connect(function(msg)
 				local emote = ""
@@ -4311,13 +5022,13 @@ do
 					emote = string.sub(msg, 8)
 				end
 				
-				if (pose == "Standing" and emoteNames[emote] ~= nil) then
-					playAnimation(emote, 0.1, Humanoid)
+				if (TASAnimation.pose == "Standing" and emoteNames[emote] ~= nil) then
+					playAnimation(emote, 0.1, TASCharacter.Humanoid)
 				end
 			end)
 
-			playAnimation("idle", 0.1, Humanoid)
-			pose = "Standing"
+			playAnimation("idle", 0.1, TASCharacter.Humanoid)
+			TASAnimation.pose = "Standing"
 
 			spawn(function()
 				while Figure.Parent ~= nil do
@@ -4331,9 +5042,9 @@ end
 
 ; (function()
 	-- Load mouse lock action
-	VirtualInputManager:SendKeyEvent(true, 304, false, workspace)
+	TASServices.VirtualInputManager:SendKeyEvent(true, 304, false, workspace)
 	wait()
-	VirtualInputManager:SendKeyEvent(true, 304, false, workspace)
+	TASServices.VirtualInputManager:SendKeyEvent(true, 304, false, workspace)
 	wait()
 	
 	local ZoomControllers = {}
@@ -4351,9 +5062,9 @@ end
 				end)
 			end
 		end
-		ConsoleMessage(tostring(#ZoomControllers).." ZoomController"..(#ZoomControllers == 1 and "" or "s"))
+		TASCharacter.ConsoleMessage(tostring(#ZoomControllers).." ZoomController"..(#ZoomControllers == 1 and "" or "s"))
 	end
-	GetZoom = function()
+	TASFunctions.GetZoom = function()
 		for _,ZoomController in pairs(ZoomControllers) do
 			local Zoom = ZoomController:GetCameraToSubjectDistance()
 			if Zoom and Zoom ~= 12.5 then
@@ -4362,7 +5073,7 @@ end
 		end
 		return 12.5
 	end
-	SetZoom = function(Zoom)
+	TASFunctions.SetZoom = function(Zoom)
 		for _, ZoomController in pairs(ZoomControllers) do
 			pcall(function()
 				ZoomController:SetCameraToSubjectDistance(Zoom)
@@ -4371,8 +5082,8 @@ end
 	end
 
 	
-	GetShiftLockEnabled = function()
-		return ShiftLockEnabled
+	TASFunctions.GetShiftLockEnabled = function()
+		return TASServices.ShiftLockEnabled
 	end
 
 	local cachedMouseLockController = nil
@@ -4400,20 +5111,20 @@ end
 		end
 	end
 
-	SetShiftLockEnabled = function(Enabled)
-		if ShiftLockEnabled ~= Enabled then
-			ShiftLockEnabled = Enabled
+	TASFunctions.SetShiftLockEnabled = function(Enabled)
+		if TASServices.ShiftLockEnabled ~= Enabled then
+			TASServices.ShiftLockEnabled = Enabled
 			if Enabled then
-				SetCursor("MouseLockedCursor")
+				TASFunctions.SetCursor("MouseLockedCursor")
 			else
-				SetCursor("ArrowFarCursor")
+				TASFunctions.SetCursor("ArrowFarCursor")
 			end
 			shiftLock(Enabled)
 		end
 	end
 		
-	SetCameraCFrame = function(NewCFrame)
-		CameraCFrame = NewCFrame
+	TASFunctions.SetCameraCFrame = function(NewCFrame)
+		TASRuntime.CameraCFrame = NewCFrame
 		workspace.CurrentCamera.CFrame = NewCFrame
 	end
 	
@@ -4428,10 +5139,10 @@ end
 		BlockFrame.Parent = BlockGui
 		BlockGui.Enabled = false
 		BlockGui.Parent = GUIParent
-		BlockInputs = function()
+		TASFunctions.BlockInputs = function()
 			BlockGui.Enabled = true
 		end
-		UnblockInputs = function()
+		TASFunctions.UnblockInputs = function()
 			BlockGui.Enabled = false
 		end
 	end
@@ -4444,24 +5155,24 @@ end
     CursorHolder.DisplayOrder = 999999  
     CursorHolder.Parent = game:GetService("CoreGui")  
 	
-	Cursor.Name = "Cursor"
-	Cursor.BackgroundTransparency = 1
-	Cursor.ZIndex = 10000
-	Cursor.Parent = CursorHolder
+	TASRuntime.Cursor.Name = "Cursor"
+	TASRuntime.Cursor.BackgroundTransparency = 1
+	TASRuntime.Cursor.ZIndex = 10000
+	TASRuntime.Cursor.Parent = CursorHolder
 	
-	Resolution = workspace.CurrentCamera.ViewportSize
+	TASCharacter.Resolution = workspace.CurrentCamera.ViewportSize
 	
-	SetCursor = function(CursorName)
-		local CursorData = Cursors[CursorName]
+	TASFunctions.SetCursor = function(CursorName)
+		local CursorData = TASConfig.Cursors[CursorName]
 		if CursorData then
-			CursorIcon = CursorData.Icon
-			CursorSize = CursorData.Size
-			CursorOffset = CursorData.Offset
+			TASRuntime.CursorIcon = CursorData.Icon
+			TASRuntime.CursorSize = CursorData.Size
+			TASRuntime.CursorOffset = CursorData.Offset
 		end
 	end
 	
 	-- Initialize cursor
-	SetCursor("ArrowFarCursor")
+	TASFunctions.SetCursor("ArrowFarCursor")
 end)()
 
 
@@ -4471,13 +5182,13 @@ IsInstalled = nil -- IsInstalled() -> bool
 SendSignal = nil -- SendSignal(Signal) -> nil
 do
 	IsInstalled = function()
-		return isfolder(AHKConnectionFolderPath)
+		return isfolder(TASConfig.AHKConnectionFolderPath)
 	end
 	SendSignal = function(Signal)
 		if IsInstalled() then
-			writefile(AHKConnectionRequestPath,Signal)
+			writefile(TASConfig.AHKConnectionRequestPath,Signal)
 		else
-			ConsoleMessage("AHK folder not found")
+			TASCharacter.ConsoleMessage("AHK folder not found")
 		end
 	end
 end
@@ -4496,6 +5207,7 @@ local CO = {}
     local nextId         = 1
     local scanComplete   = false
     local watchConn      = nil
+    local withinRecordRadius = {} -- Tracks radius transitions so re-entering objects get a full sample.
     local ropePartSet    = {}
     local originalAnchored = {}
 
@@ -4505,10 +5217,19 @@ local CO = {}
     -- can be registered at that moment.
     local anchoredCandidates = {}
     local anchoredCandidateConnections = {}
+
+    local function isWithinRecordRadius(part)
+        local radius = tonumber(TASConfig.CORecordingRadius) or 0
+        if radius <= 0 then return true end
+        local root = TASCharacter.RootPart
+        if not root or not root.Parent then return true end
+        local d = part.Position - root.Position
+        return d.X * d.X + d.Y * d.Y + d.Z * d.Z <= radius * radius
+    end
     local forceCaptureIds = {}
 
     local function isBlacklisted(part)
-        if Character and part:IsDescendantOf(Character) then return true end
+        if TASCharacter.Character and part:IsDescendantOf(TASCharacter.Character) then return true end
         for _, plr in ipairs(game.Players:GetPlayers()) do
             if plr.Character and part:IsDescendantOf(plr.Character) then return true end
         end
@@ -4607,11 +5328,11 @@ local CO = {}
             processed = processed + 1
             if processed >= CO_SCAN_CHUNK then
                 processed = 0
-                RunService.Heartbeat:Wait()
+                TASServices.RunService.Heartbeat:Wait()
             end
         end
         scanComplete = true
-        ConsoleMessage("[CO] Scanned " .. tostring(nextId - 1) .. " registered parts; watching anchored candidates")
+        TASCharacter.ConsoleMessage("[CO] Scanned " .. tostring(nextId - 1) .. " registered parts; watching anchored candidates")
     end
 
     local function startWatching()
@@ -4641,12 +5362,13 @@ local CO = {}
             anchoredCandidateConnections[part] = nil
         end
         forceCaptureIds = {}
+        withinRecordRadius = {}
         nextId         = 1
         scanComplete   = false
         scanWorkspace()
         startWatching()
-        RunService.Heartbeat:Wait()
-        ConsoleMessage("[CO] Init done, recording world objects")
+        TASServices.RunService.Heartbeat:Wait()
+        TASCharacter.ConsoleMessage("[CO] Init done, recording world objects")
         CO._initialized = true
         CO._initializing = false
         if CO._recordingRequested then
@@ -4660,22 +5382,23 @@ local CO = {}
 
     CO._initializing = false
     local function QueueCOInitialization()
-        if CO._initialized or CO._initializing or COInitializationQueued then
+        if CO._initialized or CO._initializing or TASFreeze.COInitializationQueued then
             return
         end
-        COInitializationQueued = true
+        TASFreeze.COInitializationQueued = true
         task.spawn(function()
             local ok, err = pcall(function() CO.Init() end)
-            COInitializationQueued = false
+            TASFreeze.COInitializationQueued = false
             if not ok then
                 CO._initializing = false
-                ConsoleMessage("[CO] Init failed: "..tostring(err))
+                TASCharacter.ConsoleMessage("[CO] Init failed: "..tostring(err))
             end
         end)
     end
     CO.QueueInitialization = QueueCOInitialization
 
     function CO.RecordFrame()
+        if not TASConfig.AllowClientObjectManipulation then return {} end
         if not scanComplete then return {} end
         if CO._preparedFirstFrameReady and CO._preparedFirstFrame then
             local first = CO._preparedFirstFrame
@@ -4687,29 +5410,38 @@ local CO = {}
         local forceAll = CO._forceFullFrame == true
         for id, part in pairs(objectRegistry) do
             if part and part.Parent then
-                local cf   = part.CFrame
-                local prev = lastCFrames[id]
-                local moved = forceAll or forceCaptureIds[id] == true
-                if not moved and prev then
-                    local rel = prev:ToObjectSpace(cf)
-                    local pos = rel.Position
-                    if  math.abs(pos.X)                > CO_EPSILON
-                     or math.abs(pos.Y)                > CO_EPSILON
-                     or math.abs(pos.Z)                > CO_EPSILON
-                     or math.abs(rel.XVector.X - 1)   > CO_EPSILON
-                    then
+                local inRadius = isWithinRecordRadius(part)
+                local wasInRadius = withinRecordRadius[id] == true
+                withinRecordRadius[id] = inRadius
+
+                -- Objects outside the radius are not sampled. When they re-enter,
+                -- force one complete sample even if they stopped moving.
+                if inRadius then
+                    local cf   = part.CFrame
+                    local prev = lastCFrames[id]
+                    local moved = forceAll or forceCaptureIds[id] == true or not wasInRadius
+                    if not moved and prev then
+                        local rel = prev:ToObjectSpace(cf)
+                        local pos = rel.Position
+                        if  math.abs(pos.X)                > CO_EPSILON
+                         or math.abs(pos.Y)                > CO_EPSILON
+                         or math.abs(pos.Z)                > CO_EPSILON
+                         or math.abs(rel.XVector.X - 1)   > CO_EPSILON
+                        then
+                            moved = true
+                        end
+                    elseif not moved then
                         moved = true
                     end
-                elseif not moved then
-                    moved = true
-                end
-                if moved then
-                    delta[tostring(id)] = RoundTable({cf:GetComponents()}, RoundDigits)
-                    lastCFrames[id]     = cf
-                    forceCaptureIds[id] = nil
+                    if moved then
+                        delta[tostring(id)] = RoundTable({cf:GetComponents()}, TASConfig.RoundDigits)
+                        lastCFrames[id]     = cf
+                        forceCaptureIds[id] = nil
+                    end
                 end
             else
                 forceCaptureIds[id] = nil
+                withinRecordRadius[id] = nil
             end
         end
         CO._forceFullFrame = false
@@ -4727,7 +5459,7 @@ local CO = {}
         if delta == nil then
             if not CO._coDataWarned then
                 CO._coDataWarned = true
-                ConsoleMessage("[CO] WARNING: No CO data in replay. Re-record to enable spinner sync.")
+                TASCharacter.ConsoleMessage("[CO] WARNING: No CO data in replay. Re-record to enable spinner sync.")
             end
             return
         end
@@ -4813,7 +5545,7 @@ local CO = {}
                 part.AssemblyAngularVelocity = Vector3.zero
             end
         end
-        ConsoleMessage("[CO] All tracked parts anchored")
+        TASCharacter.ConsoleMessage("[CO] All tracked parts anchored")
     end
 
     function CO.RestoreAnchors()
@@ -4826,7 +5558,7 @@ local CO = {}
             end
         end
         originalAnchored = {}
-        ConsoleMessage("[CO] Restored tracked object physics")
+        TASCharacter.ConsoleMessage("[CO] Restored tracked object physics")
     end
     function CO.RebuildFromAttributes()
         objectRegistry = {}
@@ -4839,6 +5571,7 @@ local CO = {}
             anchoredCandidateConnections[part] = nil
         end
         forceCaptureIds = {}
+        withinRecordRadius = {}
         rebuildRopePartSet()
         local highest  = 0
         for _, desc in ipairs(workspace:GetDescendants()) do
@@ -4862,7 +5595,7 @@ local CO = {}
         nextId = highest
         scanComplete = true
         startWatching()
-        ConsoleMessage("[CO] Rebuilt registry: " .. tostring(highest - 1) .. " parts")
+        TASCharacter.ConsoleMessage("[CO] Rebuilt registry: " .. tostring(highest - 1) .. " parts")
     end
 
 	function CO.GetFullStateAtFrame(frameIndex, replayTable)
@@ -4941,11 +5674,11 @@ local CO = {}
                 part.Anchored = true
             end
         end
-        FrozenHeldCO = true
+        TASFreeze.FrozenHeldCO = true
     end
 
     function CO.ReleaseHeldState()
-        if not FrozenHeldCO then return end
+        if not TASFreeze.FrozenHeldCO then return end
         for id, part in pairs(objectRegistry) do
             if part and part.Parent and originalAnchored[id] ~= nil then
                 part.AssemblyLinearVelocity = Vector3.zero
@@ -4954,7 +5687,7 @@ local CO = {}
             end
         end
         originalAnchored = {}
-        FrozenHeldCO = false
+        TASFreeze.FrozenHeldCO = false
     end
 
     function CO.Stop()
@@ -4964,8 +5697,14 @@ local CO = {}
             watchConn = nil
         end
         CO._lerpTargets  = {}
+        CO._FullStateCache = nil
         lastCoTime   = nil
         originalAnchored = {}
+        objectRegistry = {}
+        idByObject = {}
+        lastCFrames = {}
+        forceCaptureIds = {}
+        withinRecordRadius = {}
         for part, conn in pairs(anchoredCandidateConnections) do
             if conn then conn:Disconnect() end
             anchoredCandidateConnections[part] = nil
@@ -4973,6 +5712,9 @@ local CO = {}
         anchoredCandidates = {}
         forceCaptureIds = {}
         scanComplete = false
+        nextId = 1
+        CO._preparedFirstFrame = nil
+        CO._preparedFirstFrameReady = false
     end
 
     -- TAS5 compatibility/state helpers. The actual CO recording/playback model
@@ -5042,15 +5784,18 @@ local CO = {}
         local prepared = {}
         local processed = 0
         for id, part in pairs(objectRegistry) do
-            if part and part.Parent then
+            if part and part.Parent and isWithinRecordRadius(part) then
                 local cf = part.CFrame
-                prepared[tostring(id)] = RoundTable({cf:GetComponents()}, RoundDigits)
+                prepared[tostring(id)] = RoundTable({cf:GetComponents()}, TASConfig.RoundDigits)
                 lastCFrames[id] = cf
+                withinRecordRadius[id] = true
                 forceCaptureIds[id] = nil
+            else
+                withinRecordRadius[id] = false
             end
             processed = processed + 1
             if processed % 150 == 0 then
-                RunService.Heartbeat:Wait()
+                TASServices.RunService.Heartbeat:Wait()
             end
         end
         CO._preparedFirstFrame = prepared
@@ -5088,7 +5833,7 @@ local CO = {}
         if not CO._coDataWarned then
             CO._coDataWarned = true
             CO._replayHasNoCO = true
-            ConsoleMessage('[CO] WARNING: No CO data in replay. Re-record to enable spinner sync.')
+            TASCharacter.ConsoleMessage('[CO] WARNING: No CO data in replay. Re-record to enable spinner sync.')
         end
     end
 
@@ -5116,18 +5861,27 @@ local Freeze
 -- Replay Functions (assigned below)
 do
 	GetReplayFile = function()
-    if not isfolder(string.split(FolderPath,"/")[1]) then
-        makefolder(string.split(FolderPath,"/")[1])
+        local path = TASPaths.ReplayPath
+        if type(path) ~= "string" or path == "" or not isfile(path) then
+            return nil
+        end
+        local ok, content = pcall(readfile, path)
+        if ok and type(content) == "string" then
+            return content
+        end
+        return nil
     end
-    if not isfolder(FolderPath) then
-        makefolder(FolderPath)
-    end
-    if not isfile(ReplayPath) then
-        local emptyReplay = '{"Format":"TASABILITY_JSON2","Version":2,"FPS":'..tostring(math.max(1, tonumber(TASRecordingFPS) or 1))..',"Replay":[]}'
-        writefile(ReplayPath,emptyReplay)
-        return emptyReplay
-    end
-    return readfile(ReplayPath)
+
+    -- Shared cooperative codec yielding. Kept outside TAS4Codec because
+    -- JSON3/Base64 helpers also need to yield while they process large files.
+    local ReplayCodecTick = tick()
+    local function ReplayCodecYield(force)
+        local budget = math.max(0.0005, tonumber(TASConfig.ReplayCodecTimeBudget) or 0.003)
+        local now = tick()
+        if force or (now - ReplayCodecTick) >= budget then
+            TASServices.RunService.Heartbeat:Wait()
+            ReplayCodecTick = tick()
+        end
     end
 
 	local TAS4Codec = (function()
@@ -5339,14 +6093,14 @@ do
 
 	local encode = function(Table)
 		local frameCount = #Table
-		ConsoleMessage("TAS4 encoding "..tostring(frameCount).." frames")
+		TASCharacter.ConsoleMessage("TAS4 encoding "..tostring(frameCount).." frames")
 		local StartTick = tick()
 
 		-- One dictionary pass instead of separate input + animation/pose passes.
 		local animDict, animList, poseDict, poseList, inputDict, inputList = tas4BuildDictionaries(Table)
 
 		local out = {TAS4_MAGIC, string.char(TAS4_VERSION)}
-		local replayFPS = tonumber(RecordingReplayFPS or ActiveReplayFPS or TASRecordingFPS) or TASRecordingFPS
+		local replayFPS = tonumber(TASRuntime.RecordingReplayFPS or TASRuntime.ActiveReplayFPS or TASConfig.TASRecordingFPS) or TASConfig.TASRecordingFPS
 		out[#out + 1] = tas4PackU(replayFPS)
 		out[#out + 1] = tas4PackU(frameCount)
 
@@ -5405,7 +6159,7 @@ do
 		local frameOut = {}
 
 		for i = 1, frameCount do
-            if i % 64 == 0 then RunService.Heartbeat:Wait() end
+            ReplayCodecYield(false)
 			local frame = Table[i]
 			local previousFrame = Table[i - 1]
 			table.clear(frameOut)
@@ -5448,6 +6202,7 @@ do
 				frameOut[#frameOut + 1] = tas4PackU(#objectIds)
 				local lastId = 0
 				for j = 1, #objectIds do
+                    ReplayCodecYield(false)
 					local id = objectIds[j]
 					frameOut[#frameOut + 1] = tas4PackU(math.max(0, id - lastId)); lastId = id
 					local key = tostring(id)
@@ -5471,7 +6226,7 @@ do
 		end
 
 		local Encoded = table.concat(out)
-		ConsoleMessage("TAS4 encoded "..tostring(#Encoded).." bytes in "..RoundNumber(tick()-StartTick,2).." seconds")
+		TASCharacter.ConsoleMessage("TAS4 encoded "..tostring(#Encoded).." bytes in "..TASUtilityFunctions.RoundNumber(tick()-StartTick,2).." seconds")
 		return Encoded
 	end
 
@@ -5509,7 +6264,7 @@ do
 		end
 
 		for i = 1, frameCount do
-            if i % 64 == 0 then RunService.Heartbeat:Wait() end
+            ReplayCodecYield(false)
 			local tag = string.byte(data, pos); pos = pos + 1
 			if tag == 0 then
 				Replay[i] = 0
@@ -5554,6 +6309,7 @@ do
 				Frame[13] = {}
 				local lastId = 0
 				for j = 1, objectCount do
+                    ReplayCodecYield(false)
 					local deltaId; deltaId, pos = tas4ReadU(data, pos)
 					local id = lastId + deltaId; lastId = id
 					local key = tostring(id)
@@ -5586,7 +6342,7 @@ do
 			local compressedOk
 			compressedOk, compressed = pcall(function()
 				local input = buffer.fromstring(raw)
-				local out = service:CompressBuffer(input, Enum.CompressionAlgorithm.Zstd, math.max(1, math.min(22, math.floor(tonumber(TASCompressionLevel) or 3))))
+				local out = service:CompressBuffer(input, Enum.CompressionAlgorithm.Zstd, math.max(1, math.min(22, math.floor(tonumber(TASConfig.TASCompressionLevel) or 3))))
 				return buffer.tostring(out)
 			end)
 			if compressedOk and type(compressed) == "string" and #compressed < #raw then
@@ -5626,50 +6382,51 @@ do
 
 	local decode = function(String)
 		if type(String) ~= "string" then
-			ConsoleMessage("Replay decode failed: expected string, got "..type(String)); return nil
+			TASCharacter.ConsoleMessage("Replay decode failed: expected string, got "..type(String)); return nil
 		end
 		if String:sub(1, 4) == "TAS5" then
-			ConsoleMessage("Decoding TAS5 "..tostring(#String).." bytes")
+			TASCharacter.ConsoleMessage("Decoding TAS5 "..tostring(#String).." bytes")
 			local StartTick = tick()
 			local ok, raw = pcall(tas5Decompress, String)
 			if not ok then
-				ConsoleMessage("TAS5 decompress failed: "..tostring(raw)); return nil
+				TASCharacter.ConsoleMessage("TAS5 decompress failed: "..tostring(raw)); return nil
 			end
 			local ok2, Replay, replayFPS = pcall(tas4Decode, raw)
 			if not ok2 then
-				ConsoleMessage("TAS5 decode failed: "..tostring(Replay)); return nil
+				TASCharacter.ConsoleMessage("TAS5 decode failed: "..tostring(Replay)); return nil
 			end
-			ConsoleMessage("TAS5 decoded "..tostring(#Replay).." frames in "..RoundNumber(tick()-StartTick,2).." seconds")
+			TASCharacter.ConsoleMessage("TAS5 decoded "..tostring(#Replay).." frames in "..TASUtilityFunctions.RoundNumber(tick()-StartTick,2).." seconds")
 			return Replay, replayFPS
 		end
 		if String:sub(1, 4) == TAS4_MAGIC then
-			ConsoleMessage("Decoding TAS4 "..tostring(#String).." bytes")
+			TASCharacter.ConsoleMessage("Decoding TAS4 "..tostring(#String).." bytes")
 			local StartTick = tick()
 			local ok, Replay, replayFPS = pcall(tas4Decode, String)
 			if not ok then
-				ConsoleMessage("TAS4 decode failed: "..tostring(Replay)); return nil
+				TASCharacter.ConsoleMessage("TAS4 decode failed: "..tostring(Replay)); return nil
 			end
-			ConsoleMessage("TAS4 decoded "..tostring(#Replay).." frames in "..RoundNumber(tick()-StartTick,2).." seconds")
+			TASCharacter.ConsoleMessage("TAS4 decoded "..tostring(#Replay).." frames in "..TASUtilityFunctions.RoundNumber(tick()-StartTick,2).." seconds")
 			return Replay, replayFPS
 		end
 		String = String:gsub("^\239\187\191", ""):gsub("^%s+", ""):gsub("%s+$", "")
-		if String == "" then ConsoleMessage("Nothing to read"); return nil end
+		if String == "" then TASCharacter.ConsoleMessage("Nothing to read"); return nil end
 		if String:sub(1, 1) ~= "{" then
-			ConsoleMessage("Invalid replay file: unknown format"); return nil
+			TASCharacter.ConsoleMessage("Invalid replay file: unknown format"); return nil
 		end
 		local StartTick = tick()
 		local ok, Decoded = pcall(json.decode, String)
 		if not ok or type(Decoded) ~= "table" or type(Decoded.Replay) ~= "table" then
-			ConsoleMessage("Replay decode failed: invalid legacy JSON/replay data"); return nil
+			TASCharacter.ConsoleMessage("Replay decode failed: invalid legacy JSON/replay data"); return nil
 		end
-		local replayFPS = tonumber(Decoded.FPS)
-		ConsoleMessage("Legacy JSON decoded in "..RoundNumber(tick()-StartTick,2).." seconds")
+		local replayFPS = tonumber(Decoded.TASConfig.FPS)
+		TASCharacter.ConsoleMessage("Legacy JSON decoded in "..TASUtilityFunctions.RoundNumber(tick()-StartTick,2).." seconds")
 		return Decoded.Replay, replayFPS
 	end
 	return {encode = encode, decode = decode, compress = tas5Compress}
 	end)()
 
 
+    local JSONReplayCodec = (function()
 	-- Compact JSON replay codec.
     -- JSON3 keeps the file a real JSON document, but stores the replay payload
     -- in the already-tested TAS4/TAS5 binary codec.  This avoids the huge
@@ -5688,10 +6445,8 @@ do
         local oi = 0
         local i = 1
         local len = #data
-        local chunkCounter = 0
         while i <= len do
-            chunkCounter = chunkCounter + 1
-            if chunkCounter % 1024 == 0 then RunService.Heartbeat:Wait() end
+            ReplayCodecYield(false)
             local a = string.byte(data, i) or 0
             local b = (i + 1 <= len) and (string.byte(data, i + 1) or 0) or 0
             local c = (i + 2 <= len) and (string.byte(data, i + 2) or 0) or 0
@@ -5724,10 +6479,8 @@ do
         local out = {}
         local oi = 0
         local i = 1
-        local chunkCounter = 0
         while i <= #data do
-            chunkCounter = chunkCounter + 1
-            if chunkCounter % 1024 == 0 then RunService.Heartbeat:Wait() end
+            ReplayCodecYield(false)
             local aChar = data:sub(i, i)
             local bChar = data:sub(i + 1, i + 1)
             local cChar = data:sub(i + 2, i + 2)
@@ -5752,9 +6505,10 @@ do
     end
 
     local function JSON3CompressBinary(raw)
-        -- TAS4Codec.compress returns a TAS5 payload when Zstd is available,
-        -- and a valid TAS5 raw wrapper otherwise.  Keep the exact payload.
-        return TAS4Codec.compress(raw)
+        -- JSON3 already provides the outer compact container. Keep the binary
+        -- payload as plain TAS4 so a replay saved here can always be read back
+        -- without depending on EncodingService/Zstd being available.
+        return raw
     end
 
     local function JSON3DecompressBinary(payload)
@@ -5771,8 +6525,8 @@ do
         local payload = {
             Format = "TASABILITY_JSON3",
             Version = 3,
-            FPS = math.max(1, tonumber(RecordingReplayFPS or ActiveReplayFPS or ReplaySourceFPS or TASRecordingFPS) or 1),
-            Compression = (packed:sub(1, 4) == "TAS5") and "TAS5" or "TAS4",
+            FPS = math.max(1, tonumber(TASRuntime.RecordingReplayFPS or TASRuntime.ActiveReplayFPS or TASRuntime.ReplaySourceFPS or TASConfig.TASRecordingFPS) or 1),
+            Compression = "TAS4",
             Binary = "base64",
             RawBytes = #raw,
             PackedBytes = #packed,
@@ -5780,7 +6534,7 @@ do
             Data = Base64Encode(packed),
         }
         local encoded = json.encode(payload)
-        ConsoleMessage("JSON3 encoded "..tostring(#Table).." frames: "..tostring(#encoded).." bytes (binary "..tostring(#packed)..") in "..RoundNumber(tick()-StartTick,2).." seconds")
+        TASCharacter.ConsoleMessage("JSON3 encoded "..tostring(#Table).." frames: "..tostring(#encoded).." bytes (binary "..tostring(#packed)..") in "..TASUtilityFunctions.RoundNumber(tick()-StartTick,2).." seconds")
         return encoded
     end
 
@@ -5789,7 +6543,7 @@ do
             error("invalid TASABILITY JSON2 replay")
         end
         local replay = {}
-        local fps = tonumber(decoded.FPS) or TASRecordingFPS
+        local fps = tonumber(decoded.FPS) or TASConfig.TASRecordingFPS
         local function unpackCO(list)
             local result = {}
             if type(list) ~= "table" then return result end
@@ -5857,7 +6611,7 @@ do
             -- as JSON3 Version 1. Accept that representation directly when it
             -- contains a Replay table.
             if type(decoded.Replay) == "table" then
-                return decoded.Replay, tonumber(decoded.FPS) or TASRecordingFPS
+                return decoded.Replay, tonumber(decoded.FPS) or TASConfig.TASRecordingFPS
             end
 
             if jsonVersion < 1 or jsonVersion > 3 then
@@ -5868,8 +6622,15 @@ do
             end
             local packed = Base64Decode(decoded.Data)
             local ok, replay, replayFPS = pcall(TAS4Codec.decode, packed)
-            if not ok then error("JSON3 binary decode failed: "..tostring(replay)) end
-            return replay, tonumber(decoded.FPS) or replayFPS or TASRecordingFPS
+            if ok and type(replay) == "table" then
+                return replay, tonumber(decoded.FPS) or replayFPS or TASConfig.TASRecordingFPS
+            end
+            -- Compatibility fallback: some builds wrote a JSON3 container while
+            -- storing an already-decoded replay table alongside the binary payload.
+            if type(decoded.Replay) == "table" then
+                return decoded.Replay, tonumber(decoded.FPS) or TASConfig.TASRecordingFPS
+            end
+            error("JSON3 binary decode failed: "..tostring(replay))
         end
         if decoded.Format == "TASABILITY_JSON2" then
             return JSON2ReplayDecode(decoded)
@@ -5881,15 +6642,25 @@ do
         error("invalid TASABILITY JSON replay format")
     end
 
-    ReplayEncode = function(Table)
-        if Table == ReplayTable and ReplaySaveState.Encoded and ReplaySaveState.EncodedVersion == ReplaySaveState.Version then
-            ConsoleMessage("JSON3 replay reused cached encoding: "..tostring(#ReplaySaveState.Encoded).." bytes")
-            return ReplaySaveState.Encoded
+        return {
+            Encode = JSONReplayEncode,
+            Decode = JSONReplayDecode,
+        }
+    end)()
+
+    local JSONReplayEncode = JSONReplayCodec.Encode
+    local JSONReplayDecode = JSONReplayCodec.Decode
+
+
+    TASFunctions.ReplayEncode = function(Table)
+        if Table == TASRuntime.ReplayTable and TASRuntime.ReplaySaveState.Encoded and TASRuntime.ReplaySaveState.EncodedVersion == TASRuntime.ReplaySaveState.Version then
+            TASCharacter.ConsoleMessage("JSON3 replay reused cached encoding: "..tostring(#TASRuntime.ReplaySaveState.Encoded).." bytes")
+            return TASRuntime.ReplaySaveState.Encoded
         end
         local encoded = JSONReplayEncode(Table)
-        if Table == ReplayTable then
-            ReplaySaveState.Encoded = encoded
-            ReplaySaveState.EncodedVersion = ReplaySaveState.Version
+        if Table == TASRuntime.ReplayTable then
+            TASRuntime.ReplaySaveState.Encoded = encoded
+            TASRuntime.ReplaySaveState.EncodedVersion = TASRuntime.ReplaySaveState.Version
         end
         return encoded
     end
@@ -5898,121 +6669,138 @@ do
         if type(String) ~= "string" then return nil end
         if String:sub(1,1) == "{" then
             local ok, replay, replayFPS = pcall(JSONReplayDecode, String)
-            if ok then return replay, replayFPS end
-            ConsoleMessage("JSON replay decode failed: "..tostring(replay))
+            if ok and type(replay) == "table" then return replay, replayFPS end
+            -- Last-resort compatibility path for replay containers produced by
+            -- intermediate JSON3 builds. Decode the root directly and, when a
+            -- Replay table is present, prefer it over a failing binary payload.
+            local okRoot, root = pcall(json.decode, String)
+            if okRoot and type(root) == "table" then
+                if type(root.Replay) == "table" then
+                    return root.Replay, tonumber(root.FPS) or TASConfig.TASRecordingFPS
+                end
+            end
+            TASCharacter.ConsoleMessage("JSON replay decode failed: "..tostring(replay or "unknown error"))
             return nil
         end
-        return TAS4Codec.decode(String)
+        local ok, replay, replayFPS = pcall(TAS4Codec.decode, String)
+        if ok and type(replay) == "table" then return replay, replayFPS end
+        TASCharacter.ConsoleMessage("Binary replay decode failed: "..tostring(replay))
+        return nil
     end
 
-	RecordReplay = function()
-		ConsoleMessage("Waiting for input")
-		if Writing then
-			StopRecording()
-			SaveRecording()
+	TASFunctions.RecordReplay = function()
+		TASCharacter.ConsoleMessage("Waiting for input")
+		if TASRuntime.Writing then
+			TASFunctions.StopRecording()
+			TASFunctions.SaveRecording()
 			-- Persist the completed recording immediately. SaveRecording() only
 			-- moves frames into ReplayTable; it does not write Replay.json.
 			local saved = SaveToFile()
 			if saved then
-				ConsoleMessage("Recording stopped and saved")
+				TASCharacter.ConsoleMessage("Recording stopped; saving in background...")
 			else
-				ConsoleMessage("Recording stopped (nothing was saved)")
+				TASCharacter.ConsoleMessage("Recording stopped (nothing was saved)")
 			end
 			return
 		end
 		SetColorCodeFrame("WaitingForInput")
-		WaitForInput()
-		StartRecording()
-		ConsoleMessage("Recording started")
+		TASUtilityFunctions.WaitForInput()
+		TASFunctions.StartRecording()
+		TASCharacter.ConsoleMessage("Recording started")
 	end
-	StartRecording = function()
-		if not Reading then
+	TASFunctions.StartRecording = function()
+		if not TASRuntime.Reading then
 			if CO.ReleaseHeldState then pcall(CO.ReleaseHeldState) end
-			-- Prepare CO completely BEFORE enabling Writing. The initial workspace scan
-			-- must not compete with the recording timeline or produce a partial first record.
-			if not CO._initialized then
-				if CO.QueueInitialization then pcall(CO.QueueInitialization) end
-				while CO._initializing do
-					RunService.Heartbeat:Wait()
-				end
-				if not CO._initialized and CO.RebuildFromAttributes then
-					local ok, err = pcall(CO.RebuildFromAttributes)
-					if not ok then
-						ConsoleMessage('[CO] Preparation failed: '..tostring(err))
+			if TASConfig.AllowClientObjectManipulation then
+				-- Prepare CO completely BEFORE enabling Writing.
+				if not CO._initialized then
+					if TASConfig.AllowClientObjectManipulation and CO.QueueInitialization then pcall(CO.QueueInitialization) end
+					while CO._initializing do
+						TASServices.RunService.Heartbeat:Wait()
+					end
+					if not CO._initialized and CO.RebuildFromAttributes then
+						local ok, err = pcall(CO.RebuildFromAttributes)
+						if not ok then
+							TASCharacter.ConsoleMessage('[CO] Preparation failed: '..tostring(err))
+							return
+						end
+						CO._initialized = true
+					end
+					if not CO._initialized then
+						TASCharacter.ConsoleMessage('[CO] Preparation failed: initialization did not complete')
 						return
 					end
-					CO._initialized = true
 				end
-				if not CO._initialized then
-					ConsoleMessage('[CO] Preparation failed: initialization did not complete')
-					return
+				CO._recordingRequested = true
+				if CO.PrepareFirstRecordingFrame then
+					local ok, prepared = pcall(CO.PrepareFirstRecordingFrame)
+					if not ok or not prepared then
+						CO._recordingRequested = false
+						TASCharacter.ConsoleMessage('[CO] First-frame preparation failed: '..tostring(prepared))
+						return
+					end
 				end
-			end
-			CO._recordingRequested = true
-            if CO.PrepareFirstRecordingFrame then
-                local ok, prepared = pcall(CO.PrepareFirstRecordingFrame)
-                if not ok or not prepared then
-                    CO._recordingRequested = false
-                    ConsoleMessage('[CO] First-frame preparation failed: '..tostring(prepared))
-                    return
-                end
-            end
-			CO.BeginRecording()
+				CO.BeginRecording()
+				end
 			-- Client FPS cap and TAS recording FPS are independent.
 			-- Example: FPS=120, TASRecordingFPS=60 => client at 120 FPS,
 			-- replay samples at exactly 60 FPS.
-			RecordingReplayFPS = math.max(1, tonumber(TASRecordingFPS) or 1)
-			RecordingAccumulator = 0
-			InputBeganQueue = {}
-			InputEndedQueue = {}
-			AnimationQueue = {}
+			TASRuntime.RecordingReplayFPS = math.max(1, tonumber(TASConfig.TASRecordingFPS) or 1)
+			TASRuntime.RecordingAccumulator = 0
+			TASRuntime.InputBeganQueue = {}
+			TASRuntime.InputEndedQueue = {}
+			TASRuntime.AnimationQueue = {}
+			TASRuntime.ForceAnimationSync = true
 			SetColorCodeFrame("Recording")
-			Writing = true
-			RecordingFPSCapActive = true
+			TASRuntime.Writing = true
+			TASRuntime.RecordingFPSCapActive = true
 
 			-- Re-apply the client FPS cap at recording start. This does not
 			-- change the TAS sampling rate: that remains TASRecordingFPS.
 			if setfpscap then
-				pcall(setfpscap, FPS)
+				pcall(setfpscap, TASConfig.FPS)
 			end
 		end
 	end
-	StopRecording = function()
-		if not Reading then
-			Writing = false
-			RecordingFPSCapActive = false
-            PendingRecordingFlush = true
+	TASFunctions.StopRecording = function()
+		if not TASRuntime.Reading then
+			TASRuntime.Writing = false
+			TASRuntime.RecordingFPSCapActive = false
+            TASPause.PendingRecordingFlush = true
 		end
 	end
-	ResetCurrentRecording = function()
+	TASFunctions.ResetCurrentRecording = function()
 		-- Reset clears the unsaved recording, in-memory replay frames, and the current replay file.
 		ReleaseAllPlaybackKeys()
-		if Reading then
-			pcall(function() StopReading() end)
+		if TASRuntime.Reading then
+			pcall(function() TASFunctions.StopReading() end)
 		end
-		Writing = false
-		Frozen = false
-		RecordingTable = {}
-        table.clear(PlaybackWarmCache)
-		ReplayTable = {}
-        ReplaySaveState.Version = ReplaySaveState.Version + 1
-        ReplaySaveState.Encoded = nil
-        ReplaySaveState.EncodedVersion = -1
-		ReplayTableIndex = 0
-		FreezeFrame = 1
-		RecordingReplayFPS = nil
-		ActiveReplayFPS = nil
-		RecordingFPSCapActive = false
-		RecordingAccumulator = 0
-        PendingRecordingFlush = false
-		PlaybackSourcePosition = 1
-		ReplayNeedsReload = false
-		InputBeganQueue = {}
-		InputEndedQueue = {}
-		AnimationQueue = {}
-		HumanoidStateQueue = {}
-		PlaybackPressedKeys = {}
-		PlaybackAccumulator = 0
+		TASRuntime.Writing = false
+		TASFreeze.Frozen = false
+		TASRuntime.RecordingTable = {}
+        ClearPlaybackWarmCache()
+		TASRuntime.ReplayTable = {}
+        TASRuntime.SaveGeneration = TASRuntime.SaveGeneration + 1
+        TASRuntime.Saving = false
+        TASRuntime.ReplaySaveState.Version = TASRuntime.ReplaySaveState.Version + 1
+        TASRuntime.ReplaySaveState.Encoded = nil
+        TASRuntime.ReplaySaveState.EncodedVersion = -1
+		TASRuntime.ReplayTableIndex = 0
+		TASFreeze.FreezeFrame = 1
+		TASRuntime.RecordingReplayFPS = nil
+		TASRuntime.ActiveReplayFPS = nil
+		TASRuntime.RecordingFPSCapActive = false
+		TASRuntime.RecordingAccumulator = 0
+        TASPause.PendingRecordingFlush = false
+		TASRuntime.PlaybackSourcePosition = 1
+		TASPaths.ReplayNeedsReload = false
+		TASRuntime.InputBeganQueue = {}
+		TASRuntime.InputEndedQueue = {}
+		TASRuntime.AnimationQueue = {}
+		TASRuntime.ForceAnimationSync = false
+		TASRuntime.HumanoidStateQueue = {}
+		TASRuntime.PlaybackPressedKeys = {}
+		TASRuntime.PlaybackAccumulator = 0
 		-- Preserve the already-built CO registry across reset. CO.Stop() destroys the
 		-- registry and forces the next recording to rescan the whole workspace.
 		pcall(function()
@@ -6025,170 +6813,223 @@ do
 		end)
 		-- Clear the currently selected replay file as well, so reset is persistent.
 		pcall(function()
-			if isfolder(FolderPath) then
-				writefile(ReplayPath, ReplayEncode({}))
+			if type(TASPaths.ReplayPath) == "string" and isfile(TASPaths.ReplayPath) then
+				writefile(TASPaths.ReplayPath, TASFunctions.ReplayEncode({}))
 			end
 		end)
 		pcall(function()
 			if CO.InvalidateStateCache then CO.InvalidateStateCache() end
 		end)
 		SetColorCodeFrame("Idle")
-		ConsoleMessage("Recording and replay frames reset")
+		TASCharacter.ConsoleMessage("Recording and replay frames reset")
 	end
 
 	SaveToFile = function()
-    -- Flush any currently buffered recording frames before encoding.
-    -- This makes the Save action reliable even when the recording was just
-    -- stopped or when SaveToFile() is called directly while frames are buffered.
-    if #RecordingTable > 0 then
-        SaveRecording()
+    -- Move freshly recorded frames into ReplayTable immediately; the expensive
+    -- encode/compress/base64/file-write portion runs cooperatively in task.spawn.
+    if TASRuntime.Saving then
+        TASCharacter.ConsoleMessage("Save already in progress")
+        return true
     end
 
-    if #ReplayTable == 0 then
-        ConsoleMessage("Save skipped: replay has no frames (RecordingTable="..tostring(#RecordingTable)..")")
+    if #TASRuntime.RecordingTable > 0 then
+        TASFunctions.SaveRecording()
+    end
+
+    if #TASRuntime.ReplayTable == 0 then
+        TASCharacter.ConsoleMessage("Save skipped: replay has no frames (RecordingTable="..tostring(#TASRuntime.RecordingTable)..")")
         return false
     end
 
-    local targetPath = ReplayPath
+    local targetPath = TASPaths.ReplayPath
+    if type(targetPath) ~= "string" or targetPath == "" then
+        TASCharacter.ConsoleMessage("Save skipped: no replay file selected. Create/select a replay file in Files.")
+        return false
+    end
     if type(targetPath) == "string" and targetPath:lower():sub(-4) == ".tas" then
         targetPath = targetPath:sub(1, -5) .. ".json"
     end
 
-    local okEncode, ReplayEncoded = pcall(ReplayEncode, ReplayTable)
-    if not okEncode or type(ReplayEncoded) ~= "string" then
-        ConsoleMessage("Save failed during encoding: "..tostring(ReplayEncoded))
-        return false
-    end
+    local snapshot = table.clone(TASRuntime.ReplayTable)
+    local snapshotVersion = TASRuntime.ReplaySaveState.Version
+    local snapshotCount = #snapshot
+    local saveId = TASRuntime.SaveGeneration + 1
+    TASRuntime.SaveGeneration = saveId
+    TASRuntime.Saving = true
+    TASCharacter.ConsoleMessage("Saving replay in background... ("..tostring(snapshotCount).." frames)")
+    TASCharacter.ConsoleMessage("Encoding replay for: "..tostring(targetPath))
 
-    local okWrite, writeErr = pcall(function()
-        if not isfolder(FolderPath) then makefolder(FolderPath) end
-        writefile(targetPath, ReplayEncoded)
+    task.spawn(function()
+        local ok, err = pcall(function()
+            local okEncode, ReplayEncoded = pcall(TASFunctions.ReplayEncode, snapshot)
+            if not okEncode or type(ReplayEncoded) ~= "string" then
+                error("encoding failed: "..tostring(ReplayEncoded))
+            end
+
+            if saveId ~= TASRuntime.SaveGeneration then
+                TASCharacter.ConsoleMessage("Background save discarded: replay changed during encoding")
+                return
+            end
+
+            local okWrite, writeErr = pcall(function()
+                if not isfolder(TASPaths.FolderPath) then makefolder(TASPaths.FolderPath) end
+                writefile(targetPath, ReplayEncoded)
+            end)
+            if not okWrite then
+                error("writefile failed: "..tostring(writeErr))
+            end
+
+            -- Only publish the cache/file state if the replay was not changed
+            -- while this background save was running.
+            if saveId == TASRuntime.SaveGeneration and snapshotVersion == TASRuntime.ReplaySaveState.Version then
+                TASPaths.ReplayPath = targetPath
+                TASPaths.ReplayNeedsReload = true
+                TASPaths.LastLoadedPath = nil
+                TASRuntime.ReplaySaveState.Encoded = ReplayEncoded
+                TASRuntime.ReplaySaveState.EncodedVersion = TASRuntime.ReplaySaveState.Version
+            end
+
+            TASCharacter.ConsoleMessage("Saved JSON replay: "..tostring(targetPath).." ("..tostring(#ReplayEncoded).." bytes, "..tostring(snapshotCount).." frames)")
+        end)
+
+        if not ok then
+            TASCharacter.ConsoleMessage("Save failed: "..tostring(err))
+        end
+        if saveId == TASRuntime.SaveGeneration then
+            TASRuntime.Saving = false
+        end
     end)
-    if not okWrite then
-        ConsoleMessage("Save failed during writefile: "..tostring(writeErr))
-        return false
-    end
 
-    ReplayPath = targetPath
-    -- Force the next Read to validate the file we just wrote instead of silently
-    -- using the in-memory replay cache. This makes first-save/first-read reliable.
-    ReplayNeedsReload = true
-    LastLoadedPath = nil
-    ReplaySaveState.Encoded = ReplayEncoded
-    ReplaySaveState.EncodedVersion = ReplaySaveState.Version
-    ConsoleMessage("Saved JSON replay: "..tostring(ReplayPath).." ("..tostring(#ReplayEncoded).." bytes, "..tostring(#ReplayTable).." frames)")
     return true
 end
-	
-	SaveRecording = function()
-    if PendingRecordingFlush then
+	TASFunctions.SaveRecording = function()
+    if TASPause.PendingRecordingFlush then
         local deadline = tick() + 0.25
-        while PendingRecordingFlush and tick() < deadline do
-            RunService.Heartbeat:Wait()
+        while TASPause.PendingRecordingFlush and tick() < deadline do
+            TASServices.RunService.Heartbeat:Wait()
         end
     end
 
-    local count = #RecordingTable
+    local count = #TASRuntime.RecordingTable
     if count > 0 then
-        local recordingFPS = RecordingReplayFPS or TASRecordingFPS
-        ReplaySaveState.Version = ReplaySaveState.Version + 1
-        ReplaySaveState.Encoded = nil
-        ReplaySaveState.EncodedVersion = -1
+        local recordingFPS = TASRuntime.RecordingReplayFPS or TASConfig.TASRecordingFPS
+        TASRuntime.ReplaySaveState.Version = TASRuntime.ReplaySaveState.Version + 1
+        TASRuntime.ReplaySaveState.Encoded = nil
+        TASRuntime.ReplaySaveState.EncodedVersion = -1
+        TASRuntime.SaveGeneration = TASRuntime.SaveGeneration + 1
+        TASRuntime.Saving = false
 
-        local first = #ReplayTable + 1
+        local first = #TASRuntime.ReplayTable + 1
         if table.move then
-            table.move(RecordingTable, 1, count, first, ReplayTable)
+            table.move(TASRuntime.RecordingTable, 1, count, first, TASRuntime.ReplayTable)
         else
             for i = 1, count do
-                ReplayTable[first + i - 1] = RecordingTable[i]
+                TASRuntime.ReplayTable[first + i - 1] = TASRuntime.RecordingTable[i]
             end
         end
 
-        ReplaySourceFPS = math.max(1, tonumber(recordingFPS) or 1)
-        ActiveReplayFPS = ReplaySourceFPS
+        TASRuntime.ReplaySourceFPS = math.max(1, tonumber(recordingFPS) or 1)
+        TASRuntime.ActiveReplayFPS = TASRuntime.ReplaySourceFPS
         if CO.InvalidateStateCache then
             CO.InvalidateStateCache()
         end
-        RecordingTable = {}
-        ReplayNeedsReload = false
-        ConsoleMessage("Saved recording to memory at "..tostring(ActiveReplayFPS).." FPS")
+        TASRuntime.RecordingTable = {}
+        TASPaths.ReplayNeedsReload = false
+        TASCharacter.ConsoleMessage("Saved recording to memory at "..tostring(TASRuntime.ActiveReplayFPS).." FPS")
     end
 end
-		DiscardRecording = function()
-		if #RecordingTable > 0 then
-			RecordingTable = {}
-			ConsoleMessage("Discarded")
+		TASFunctions.DiscardRecording = function()
+		if #TASRuntime.RecordingTable > 0 then
+			TASRuntime.RecordingTable = {}
+			TASCharacter.ConsoleMessage("Discarded")
 		end
 	end
-	StartReading = function()
-    if Reading then
-        ConsoleMessage("You are already reading")
+	TASFunctions.StartReading = function()
+    if TASRuntime.Reading then
+        TASCharacter.ConsoleMessage("You are already reading")
         return
     end
-    if PendingReadingStart then
-        ConsoleMessage("Replay is already loading")
+    if TASFreeze.PendingReadingStart then
+        TASCharacter.ConsoleMessage("Replay is already loading")
         return
     end
 
-    PendingReadingStart = true
+    TASFreeze.PendingReadingStart = true
+    TASCharacter.ConsoleMessage("Loading replay in background...")
     task.spawn(function()
         local ok, err = pcall(function()
-            if ReplayNeedsReload or ReplayPath ~= LastLoadedPath then
+            if TASPaths.ReplayNeedsReload or TASPaths.ReplayPath ~= TASPaths.LastLoadedPath then
                 local fileContent = GetReplayFile()
+                if not fileContent then
+                    TASRuntime.ReplayTable = {}
+                    TASPaths.ReplayNeedsReload = false
+                    TASPaths.LastLoadedPath = TASPaths.ReplayPath
+                    SetColorCodeFrame("Idle")
+                    TASCharacter.ConsoleMessage("No replay file selected or file does not exist")
+                    return
+                end
+                TASCharacter.ConsoleMessage("Reading replay file: "..tostring(TASPaths.ReplayPath)
+                    .." ("..tostring(#fileContent).." bytes)")
                 local decoded, replayFPS = ReplayDecode(fileContent)
                 if decoded then
-                    ReplayTable = decoded
-                    ReplaySaveState.Version = ReplaySaveState.Version + 1
-                    ReplaySaveState.Encoded = (type(fileContent) == "string" and fileContent ~= "") and fileContent or nil
-                    ReplaySaveState.EncodedVersion = ReplaySaveState.Encoded and ReplaySaveState.Version or -1
-                    ReplaySourceFPS = math.max(1, tonumber(replayFPS or TASRecordingFPS) or 1)
-                    ActiveReplayFPS = ReplaySourceFPS
-                    ReplayTableIndex = 1
-                    ReplayNeedsReload = false
-                    LastLoadedPath = ReplayPath
-                    ConsoleMessage("Decoded replay from file at "..tostring(ActiveReplayFPS).." FPS")
+                    TASRuntime.ReplayTable = decoded
+                    TASRuntime.ReplaySaveState.Version = TASRuntime.ReplaySaveState.Version + 1
+                    TASRuntime.ReplaySaveState.Encoded = (type(fileContent) == "string" and fileContent ~= "") and fileContent or nil
+                    TASRuntime.ReplaySaveState.EncodedVersion = TASRuntime.ReplaySaveState.Encoded and TASRuntime.ReplaySaveState.Version or -1
+                    TASRuntime.ReplaySourceFPS = math.max(1, tonumber(replayFPS or TASConfig.TASRecordingFPS) or 1)
+                    TASRuntime.ActiveReplayFPS = TASRuntime.ReplaySourceFPS
+                    TASRuntime.PlaybackInterval = 1 / TASRuntime.ActiveReplayFPS
+                    TASRuntime.ReplayTableIndex = 1
+                    TASPaths.ReplayNeedsReload = false
+                    TASPaths.LastLoadedPath = TASPaths.ReplayPath
+                    TASCharacter.ConsoleMessage("Decoded replay from file at "..tostring(TASRuntime.ActiveReplayFPS).." FPS")
                 else
-                    ReplayTable = {}
+                    TASRuntime.ReplayTable = {}
                     SetColorCodeFrame("Idle")
                     error("Failed to decode replay")
                 end
             else
-                ConsoleMessage("Using cached replay (no decode needed)")
+                TASCharacter.ConsoleMessage("Using cached replay (no decode needed)")
             end
 
-            if not (ReplayTable and #ReplayTable > 0) then
+            if not (TASRuntime.ReplayTable and #TASRuntime.ReplayTable > 0) then
                 SetColorCodeFrame("Idle")
-                ConsoleMessage("No replay data to read")
+                TASCharacter.ConsoleMessage("No replay data to read")
                 return
             end
 
-            if Frozen then
+            if TASFreeze.Frozen then
                 Freeze(false, true)
             end
 
-            Writing = false
-            RecordingFPSCapActive = false
-            Paused = false
+            TASRuntime.Writing = false
+            TASRuntime.RecordingFPSCapActive = false
+            TASRuntime.Paused = false
             EndPlaybackPause()
-            AnimateDisabled = false
+            TASRuntime.AnimateDisabled = false
             if not AllowChangingPhysics then
                 ApplyConfiguredPhysics(false)
             end
-            ReplayTableIndex = 1
-            PlaybackAccumulator = 0
+            TASRuntime.ReplayTableIndex = 1
+            TASRuntime.PlaybackInterval = 1 / math.max(1, tonumber(TASRuntime.ActiveReplayFPS or TASRuntime.ReplaySourceFPS or TASConfig.TASRecordingFPS) or 1)
+            TASRuntime.PlaybackAccumulator = 0
 
-            if CO.ReleaseHeldState then pcall(CO.ReleaseHeldState) end
+            if TASConfig.AllowClientObjectManipulation and CO.ReleaseHeldState then pcall(CO.ReleaseHeldState) end
 
-            if not CO._initialized and not CO._initializing and CO.QueueInitialization then
-                pcall(CO.QueueInitialization)
-            end
-            while CO._initializing do
-                RunService.Heartbeat:Wait()
-            end
-            if CO._initialized and CO.ReuseRegistryForPlayback then
-                CO.ReuseRegistryForPlayback()
-            elseif CO.RebuildFromAttributes then
-                CO.RebuildFromAttributes()
+            if TASConfig.AllowClientObjectManipulation then
+                if TASConfig.AllowClientObjectManipulation and not CO._initialized and not CO._initializing and CO.QueueInitialization then
+                    pcall(CO.QueueInitialization)
+                end
+                while CO._initializing do
+                    TASServices.RunService.Heartbeat:Wait()
+                end
+                if CO._initialized and CO.ReuseRegistryForPlayback then
+                    CO.ReuseRegistryForPlayback()
+                elseif CO.RebuildFromAttributes then
+                    CO.RebuildFromAttributes()
+                end
+            elseif CO._initialized and CO.Stop then
+                pcall(CO.Stop)
             end
             CO.BeginPlaybackCleanup()
             CO.ResetTargets()
@@ -6196,27 +7037,27 @@ end
             CO._replayHasNoCO = false
             CO.AnchorAll()
 
-            if not CachedAnimateScript or not CachedAnimateScript.Parent then
-                CachedAnimateScript = findAnimateScript(Character)
+            if not TASPause.CachedAnimateScript or not TASPause.CachedAnimateScript.Parent then
+                TASPause.CachedAnimateScript = findAnimateScript(TASCharacter.Character)
             end
 
-            ReplayCharacterCollisionStates = {}
-            if Character then
-                for _, part in ipairs(Character:GetDescendants()) do
+            TASFreeze.ReplayCharacterCollisionStates = {}
+            if TASCharacter.Character then
+                for _, part in ipairs(TASCharacter.Character:GetDescendants()) do
                     if part:IsA("BasePart") then
-                        ReplayCharacterCollisionStates[part] = part.CanCollide
+                        TASFreeze.ReplayCharacterCollisionStates[part] = part.CanCollide
                         part.CanCollide = false
                     end
                 end
             end
 
-            table.clear(PlaybackWarmCache)
-            local warmCount = math.min(12, #ReplayTable)
+            ClearPlaybackWarmCache()
+            local warmCount = math.min(12, #TASRuntime.ReplayTable)
             for warmIndex = 1, warmCount do
-                local warmFrame = ReplayTable[warmIndex]
+                local warmFrame = TASRuntime.ReplayTable[warmIndex]
                 if type(warmFrame) == "table" then
                     local warmInputs = warmFrame[12] or {{}, {}}
-                    PlaybackWarmCache[warmIndex] = {
+                    TASPause.PlaybackWarmCache[warmIndex] = {
                         hrpCFrame = FastTableToCFrame(warmFrame[1]),
                         camCFrame = FastTableToCFrame(warmFrame[7]),
                         hrpVel = FastTableToVector3(warmFrame[5]),
@@ -6233,80 +7074,82 @@ end
                     }
                 end
                 if warmIndex % 4 == 0 then
-                    RunService.Heartbeat:Wait()
+                    TASServices.RunService.Heartbeat:Wait()
                 end
             end
 
-            BlockInputs()
-            Reading = true
+            TASFunctions.BlockInputs()
+            TASRuntime.Reading = true
             SetColorCodeFrame("Reading")
-            ConsoleMessage("Reading started")
-            ConsoleMessage("Length: "..RoundNumber(#ReplayTable/math.max(ReplaySourceFPS, 1)).." seconds (playback "..tostring(ActiveReplayFPS).." FPS)")
+            TASCharacter.ConsoleMessage("Reading started")
+            TASCharacter.ConsoleMessage("Length: "..TASUtilityFunctions.RoundNumber(#TASRuntime.ReplayTable/math.max(TASRuntime.ReplaySourceFPS, 1)).." seconds (playback "..tostring(TASRuntime.ActiveReplayFPS).." FPS)")
         end)
 
-        PendingReadingStart = false
+        TASFreeze.PendingReadingStart = false
         if not ok then
-            Reading = false
+            TASRuntime.Reading = false
             EndPlaybackPause()
             SetColorCodeFrame("Idle")
-            ConsoleMessage("Replay load failed: "..tostring(err))
+            TASCharacter.ConsoleMessage("Replay load failed: "..tostring(err))
         end
     end)
 end
-	StopReading = function(PreserveCurrentFrame)
+	TASFunctions.StopReading = function(PreserveCurrentFrame)
         local savedCFrame, savedVelocity, savedRotVelocity
-        if Reading and PreserveCurrentFrame and Character and Character:FindFirstChild("HumanoidRootPart") then
-            local hrp = Character.HumanoidRootPart
+        if TASRuntime.Reading and PreserveCurrentFrame and TASCharacter.Character and TASCharacter.Character:FindFirstChild("HumanoidRootPart") then
+            local hrp = TASCharacter.Character.HumanoidRootPart
             savedCFrame = hrp.CFrame
             savedVelocity = hrp.Velocity
             savedRotVelocity = hrp.RotVelocity
         end
-		Paused = false
+		TASRuntime.Paused = false
         EndPlaybackPause()
 		ReleaseAllPlaybackKeys()
-		PlaybackAccumulator = 0
-		if Reading then
-            Reading = false
-            if PreserveCurrentFrame and CO.HoldCurrentState then
-                pcall(CO.HoldCurrentState)
-            else
-                pcall(CO.RestoreAnchors)
-            end
-            CO.ResetTargets()
-            if not PreserveCurrentFrame then
-                CO.Stop()
+		TASRuntime.PlaybackAccumulator = 0
+		if TASRuntime.Reading then
+            TASRuntime.Reading = false
+            if TASConfig.AllowClientObjectManipulation then
+                if PreserveCurrentFrame and CO.HoldCurrentState then
+                    pcall(CO.HoldCurrentState)
+                else
+                    pcall(CO.RestoreAnchors)
+                end
+                if CO.ResetTargets then CO.ResetTargets() end
+                if not PreserveCurrentFrame and CO.Stop then
+                    CO.Stop()
+                end
             end
 
-			UnblockInputs() -- Enable scrolling and clicks
-			if ReplayCharacterCollisionStates and Character then
-				for part, canCollide in pairs(ReplayCharacterCollisionStates) do
+			TASFunctions.UnblockInputs() -- Enable scrolling and clicks
+			if TASFreeze.ReplayCharacterCollisionStates and TASCharacter.Character then
+				for part, canCollide in pairs(TASFreeze.ReplayCharacterCollisionStates) do
 					if part and part.Parent then
 						part.CanCollide = canCollide
 					end
 				end
 			end
-			ReplayCharacterCollisionStates = nil
-            if ReplayAnimateScript and ReplayAnimateScript.Parent then
-                ReplayAnimateScript.Disabled = (ReplayAnimateScriptDisabled == true)
+			TASFreeze.ReplayCharacterCollisionStates = nil
+            if TASFreeze.ReplayAnimateScript and TASFreeze.ReplayAnimateScript.Parent then
+                TASFreeze.ReplayAnimateScript.Disabled = (TASFreeze.ReplayAnimateScriptDisabled == true)
             end
-            ReplayAnimateScript = nil
-            ReplayAnimateScriptDisabled = nil
-			AnimateDisabled = false -- Enable fake animate script
+            TASFreeze.ReplayAnimateScript = nil
+            TASFreeze.ReplayAnimateScriptDisabled = nil
+			TASRuntime.AnimateDisabled = false -- Enable fake animate script
 			if not AllowChangingPhysics then
 				ApplyConfiguredPhysics(false)
 			end
-            if PreserveCurrentFrame and savedCFrame and Character:FindFirstChild("HumanoidRootPart") then
-                local hrp = Character.HumanoidRootPart
+            if PreserveCurrentFrame and savedCFrame and TASCharacter.Character:FindFirstChild("HumanoidRootPart") then
+                local hrp = TASCharacter.Character.HumanoidRootPart
                 hrp.CFrame = savedCFrame
                 hrp.Velocity = savedVelocity
                 hrp.RotVelocity = savedRotVelocity
             end
-            PlaybackSourcePosition = math.max(1, PlaybackSourcePosition or ReplayTableIndex or 1)
+            TASRuntime.PlaybackSourcePosition = math.max(1, TASRuntime.PlaybackSourcePosition or TASRuntime.ReplayTableIndex or 1)
 			SetColorCodeFrame("Idle")
-			ConsoleMessage("Reading stopped")
-            table.clear(PlaybackWarmCache)
+			TASCharacter.ConsoleMessage("Reading stopped")
+            ClearPlaybackWarmCache()
 		else
-			ConsoleMessage("You are not reading")
+			TASCharacter.ConsoleMessage("You are not reading")
 		end
 	end
 end
@@ -6315,42 +7158,101 @@ end
 --local Freeze -- Freeze(NewFrozen) -> nil
 do
 	Freeze = function(NewFrozen, DoNotRecord)
-        if Frozen == NewFrozen or Reading then
+        if TASFreeze.Frozen == NewFrozen or TASRuntime.Reading then
             return
         end
-        SeekDirection = 0
+        TASFreeze.SeekDirection = 0
         if NewFrozen then
-            Frozen = true
-            StopRecording()
-            SaveRecording()
-            FreezeFrame = math.clamp(#ReplayTable, 1, math.max(#ReplayTable, 1))
+            TASFreeze.Frozen = true
+            TASFunctions.StopRecording()
+            TASFunctions.SaveRecording()
+            TASFreeze.FreezeFrame = math.clamp(#TASRuntime.ReplayTable, 1, math.max(#TASRuntime.ReplayTable, 1))
+            TASFreeze.ResumeCFrame = nil
+            TASFreeze.ResumeVelocity = nil
+            TASFreeze.ResumeRotVelocity = nil
+            TASFreeze.ResumeHumanoidState = nil
+            TASFreeze.ResumeAnimPose = nil
+            TASFreeze.ResumeAnimSpeed = nil
+            do
+                local freezeFrameData = TASRuntime.ReplayTable[math.clamp(TASUtilityFunctions.RoundNumber(TASFreeze.FreezeFrame, 0), 1, math.max(#TASRuntime.ReplayTable, 1))]
+                if type(freezeFrameData) == "table" then
+                    if freezeFrameData[1] then TASFreeze.ResumeCFrame = FastTableToCFrame(freezeFrameData[1]) end
+                    if freezeFrameData[5] then TASFreeze.ResumeVelocity = FastTableToVector3(freezeFrameData[5]) end
+                    if freezeFrameData[6] then TASFreeze.ResumeRotVelocity = FastTableToVector3(freezeFrameData[6]) end
+                    TASFreeze.ResumeHumanoidState = freezeFrameData[4]
+                    TASFreeze.ResumeAnimPose = freezeFrameData[9]
+                    TASFreeze.ResumeAnimSpeed = freezeFrameData[3]
+                end
+            end
             ReleaseAllPlaybackKeys()
-            CO.ResetTargets()
-            CO.AnchorAll()
+            if TASConfig.AllowClientObjectManipulation then
+                if CO.ResetTargets then CO.ResetTargets() end
+                if CO.AnchorAll then CO.AnchorAll() end
+            end
+
+            -- Freeze the actual player immediately; CO only manages recorded objects.
+            pcall(function()
+                local character = TASCharacter.Character
+                local hrp = character and character:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    hrp.Anchored = true
+                    hrp.AssemblyLinearVelocity = Vector3.zero
+                    hrp.AssemblyAngularVelocity = Vector3.zero
+                    hrp.Velocity = Vector3.zero
+                    hrp.RotVelocity = Vector3.zero
+                end
+                if TASCharacter.Humanoid then
+                    TASCharacter.Humanoid.PlatformStand = true
+                end
+            end)
+
+            -- Keep the player frozen even if game code attempts to unanchor/move it.
+            pcall(function()
+                TASServices.RunService:UnbindFromRenderStep(TASFreeze.FrozenCharacterBindName)
+                TASServices.RunService:BindToRenderStep(
+                    TASFreeze.FrozenCharacterBindName,
+                    Enum.RenderPriority.Character.Value + 10,
+                    function()
+                        if not TASFreeze.Frozen then return end
+                        local character = TASCharacter.Character
+                        local hrp = character and character:FindFirstChild("HumanoidRootPart")
+                        if hrp then
+                            hrp.Anchored = true
+                            hrp.AssemblyLinearVelocity = Vector3.zero
+                            hrp.AssemblyAngularVelocity = Vector3.zero
+                        end
+                        if TASCharacter.Humanoid then
+                            TASCharacter.Humanoid.PlatformStand = true
+                        end
+                    end
+                )
+            end)
+
+            -- Freeze the mouse position independently of the camera-freeze option.
+            pcall(function()
+                TASFreeze.FrozenMouseBehavior = TASServices.UserInputService.MouseBehavior
+                TASServices.UserInputService.MouseBehavior = Enum.MouseBehavior.LockCurrentPosition
+            end)
 
             if workspace.CurrentCamera and not (movecameraonfroze and movecameraonfroze.Value) then
-                FrozenCameraType = workspace.CurrentCamera.CameraType
-                pcall(function()
-                    FrozenMouseBehavior = UserInputService.MouseBehavior
-                    UserInputService.MouseBehavior = Enum.MouseBehavior.LockCurrentPosition
-                end)
+                TASFreeze.FrozenCameraType = workspace.CurrentCamera.CameraType
                 workspace.CurrentCamera.CameraType = Enum.CameraType.Scriptable
-                local f = ReplayTable[math.clamp(RoundNumber(FreezeFrame, 0), 1, math.max(#ReplayTable, 1))]
+                local f = TASRuntime.ReplayTable[math.clamp(TASUtilityFunctions.RoundNumber(TASFreeze.FreezeFrame, 0), 1, math.max(#TASRuntime.ReplayTable, 1))]
                 if type(f) == "table" and f[7] then
-                    FrozenCameraCFrame = TableToCFrame(f[7])
-                    workspace.CurrentCamera.CFrame = FrozenCameraCFrame
+                    TASFreeze.FrozenCameraCFrame = FastTableToCFrame(f[7])
+                    workspace.CurrentCamera.CFrame = TASFreeze.FrozenCameraCFrame
                 else
-                    FrozenCameraCFrame = workspace.CurrentCamera.CFrame
+                    TASFreeze.FrozenCameraCFrame = workspace.CurrentCamera.CFrame
                 end
-
                 pcall(function()
-                    RunService:BindToRenderStep(FrozenCameraBindName, Enum.RenderPriority.Camera.Value + 10, function()
-                        if not Frozen then return end
+                    TASServices.RunService:UnbindFromRenderStep(TASFreeze.FrozenCameraBindName)
+                    TASServices.RunService:BindToRenderStep(TASFreeze.FrozenCameraBindName, Enum.RenderPriority.Camera.Value + 10, function()
+                        if not TASFreeze.Frozen then return end
                         local cam = workspace.CurrentCamera
                         if cam then
                             cam.CameraType = Enum.CameraType.Scriptable
-                            if FrozenCameraCFrame then
-                                cam.CFrame = FrozenCameraCFrame
+                            if TASFreeze.FrozenCameraCFrame then
+                                cam.CFrame = TASFreeze.FrozenCameraCFrame
                             end
                         end
                     end)
@@ -6358,44 +7260,86 @@ do
             end
             SetColorCodeFrame("Frozen")
         else
-            pcall(function() RunService:UnbindFromRenderStep(FrozenCameraBindName) end)
-            CO.RestoreAnchors()
-            CO.ResetTargets()
-            if FrozenCameraType and workspace.CurrentCamera then
-                workspace.CurrentCamera.CameraType = FrozenCameraType
-                FrozenCameraType = nil
+            pcall(function() TASServices.RunService:UnbindFromRenderStep(TASFreeze.FrozenCharacterBindName) end)
+            pcall(function() TASServices.RunService:UnbindFromRenderStep(TASFreeze.FrozenCameraBindName) end)
+            if TASConfig.AllowClientObjectManipulation then
+                if CO.RestoreAnchors then CO.RestoreAnchors() end
+                if CO.ResetTargets then CO.ResetTargets() end
             end
-            FrozenCameraCFrame = nil
-            Frozen = false
-            pcall(function()
-                if Character and Character:FindFirstChild("HumanoidRootPart") then
-                    Character.HumanoidRootPart.Anchored = false
+            if TASFreeze.FrozenCameraType and workspace.CurrentCamera then
+                local cam = workspace.CurrentCamera
+                local restoreType = TASFreeze.FrozenCameraType
+                -- Never restore Scriptable from a previous freeze cycle.
+                -- That would leave the camera permanently locked after M.
+                if restoreType == Enum.CameraType.Scriptable then
+                    restoreType = Enum.CameraType.Custom
                 end
-                if Humanoid then
-                    Humanoid.PlatformStand = false
+                cam.CameraType = restoreType
+                if restoreType == Enum.CameraType.Custom and TASCharacter.Humanoid then
+                    pcall(function() cam.CameraSubject = TASCharacter.Humanoid end)
+                end
+                TASFreeze.FrozenCameraType = nil
+            end
+            pcall(function()
+                if TASFreeze.FrozenMouseBehavior ~= nil then
+                    TASServices.UserInputService.MouseBehavior = TASFreeze.FrozenMouseBehavior
+                end
+            end)
+            TASFreeze.FrozenMouseBehavior = nil
+            TASFreeze.FrozenCameraCFrame = nil
+            TASFreeze.FrozenCameraType = nil
+            TASFreeze.Frozen = false
+            pcall(function()
+                local character = TASCharacter.Character
+                local hrp = character and character:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    hrp.Anchored = false
+                end
+                if TASCharacter.Humanoid then
+                    TASCharacter.Humanoid.PlatformStand = false
                 end
                 if not AllowChangingPhysics then
                     ApplyConfiguredPhysics(false)
                 end
+                -- Restore the selected replay frame after unanchoring. Without
+                -- this, the frozen-character heartbeat has already zeroed the
+                -- jump/fall velocity, so unfreezing causes an immediate drop.
+                if hrp then
+                    if TASFreeze.ResumeCFrame then hrp.CFrame = TASFreeze.ResumeCFrame end
+                    if TASFreeze.ResumeVelocity then
+                        hrp.AssemblyLinearVelocity = TASFreeze.ResumeVelocity
+                        hrp.Velocity = TASFreeze.ResumeVelocity
+                    end
+                    if TASFreeze.ResumeRotVelocity then
+                        hrp.AssemblyAngularVelocity = TASFreeze.ResumeRotVelocity
+                        hrp.RotVelocity = TASFreeze.ResumeRotVelocity
+                    end
+                end
+                if TASCharacter.Humanoid and TASFreeze.ResumeHumanoidState ~= nil then
+                    pcall(function() TASCharacter.Humanoid:ChangeState(TASFreeze.ResumeHumanoidState) end)
+                end
+                if TASFreeze.ResumeAnimPose then TASAnimation.pose = TASFreeze.ResumeAnimPose end
+                if TASFreeze.ResumeAnimSpeed then pcall(setAnimationSpeed, TASFreeze.ResumeAnimSpeed) end
             end)
             if DoNotRecord then
                 SetColorCodeFrame("Idle")
             else
-                for Index = #ReplayTable, FreezeFrame, -1 do
-                    ReplayTable[Index] = nil
+                for Index = #TASRuntime.ReplayTable, TASFreeze.FreezeFrame, -1 do
+                    TASRuntime.ReplayTable[Index] = nil
                 end
-                StartRecording()
+                TASFunctions.StartRecording()
                 SetColorCodeFrame("Recording")
             end
         end
     end
 end
+
 -- Commands
 Commands = {}
 do
 	Commands["help"] = function(Args)
 		if Args == "help" then
-			ConsoleMessage("help <command>: Shows a list of all commands, or a specific command")
+			TASCharacter.ConsoleMessage("help <command>: Shows a list of all commands, or a specific command")
 		else
 			local Command = Args[1]
 			if Command then
@@ -6403,7 +7347,7 @@ do
 				if Commands[Command] then
 					Commands[Command]("help")
 				else
-					ConsoleMessage("Command", Command, "was not found")
+					TASCharacter.ConsoleMessage("Command", Command, "was not found")
 				end
 			else
 				for _,Command in pairs(Commands) do
@@ -6412,51 +7356,64 @@ do
 			end
 		end
 	end
+	Commands["clean"] = function(Args)
+		if Args == "help" then
+			TASCharacter.ConsoleMessage("clean: Clears all messages from the in-game console")
+		else
+			if console and console.ClearLogs then
+				console:ClearLogs()
+			end
+		end
+	end
+
 	Commands["erase"] = function(Args)
     if Args == "help" then
-        ConsoleMessage("erase: Erases all data from the folder",PlaceId)
+        TASCharacter.ConsoleMessage("erase: Erases the selected replay file",TASPaths.PlaceId)
     else
-        writefile(ReplayPath, ReplayEncode({}))
-        ReplayTable = {}
-        ReplaySaveState.Version = ReplaySaveState.Version + 1
-        ReplaySaveState.Encoded = nil
-        ReplaySaveState.EncodedVersion = -1
-        ReplayNeedsReload = false
-        LastLoadedPath = ReplayPath
-        return ReplayPath.." has been erased (cache cleared)"
+        if type(TASPaths.ReplayPath) ~= "string" or not isfile(TASPaths.ReplayPath) then
+            return "No replay file selected"
+        end
+        writefile(TASPaths.ReplayPath, TASFunctions.ReplayEncode({}))
+        TASRuntime.ReplayTable = {}
+        TASRuntime.ReplaySaveState.Version = TASRuntime.ReplaySaveState.Version + 1
+        TASRuntime.ReplaySaveState.Encoded = nil
+        TASRuntime.ReplaySaveState.EncodedVersion = -1
+        TASPaths.ReplayNeedsReload = false
+        TASPaths.LastLoadedPath = TASPaths.ReplayPath
+        return TASPaths.ReplayPath.." has been erased (cache cleared)"
     end
 end
 
 	Commands["reset"] = function(Args)
 		if Args == "help" then
-			ConsoleMessage("reset: Clears the current recording, all replay frames, and the current replay file")
+			TASCharacter.ConsoleMessage("reset: Clears the current recording, all replay frames, and the current replay file")
 		else
-			ResetCurrentRecording()
+			TASFunctions.ResetCurrentRecording()
 			return "Current recording and replay frames reset"
 		end
 	end
 	Commands["setsdm"] = function(Args)
 		if Args == "help" then
-			ConsoleMessage("setsdm <number SeekDirectionMultiplier>: Sets speed multiplier when using R and T while frozen")
+			TASCharacter.ConsoleMessage("setsdm <number SeekDirectionMultiplier>: Sets speed multiplier when using R and T while frozen")
 		else
 			local Number = tonumber(Args[1]) or 1
 			if Number then
-				local OldValue = SeekDirectionMultiplier
-				SeekDirectionMultiplier = Number
+				local OldValue = TASFreeze.SeekDirectionMultiplier
+				TASFreeze.SeekDirectionMultiplier = Number
 				return "SeekDirectionMultiplier has been set from "..tostring(OldValue).." to "..tostring(Number)
 			end
 		end
 	end
 	Commands["rejoin"] = function(Args)
 		if Args == "help" then
-			ConsoleMessage("rejoin <bool SaveReplay>: Sets one of the configs at the top of the script (PlaybackInputs, etc)")
+			TASCharacter.ConsoleMessage("rejoin <bool SaveReplay>: Sets one of the configs at the top of the script (PlaybackInputs, etc)")
 		else
 			local SaveReplay = Args[1] and string.lower(Args[1])
-			ConsoleMessage("Saving...")
+			TASCharacter.ConsoleMessage("Saving...")
 			if SaveReplay == "true" or SaveReplay == "yes" or SaveReplay == "1" or SaveReplay == "save" then
 				SaveToFile()
 			end
-			ConsoleMessage("Rejoining...")
+			TASCharacter.ConsoleMessage("Rejoining...")
 			if #game.Players:GetPlayers() <= 1 then
 				game.Players.LocalPlayer:Kick("\nRejoining...")
 				wait()
@@ -6469,24 +7426,16 @@ end
 	end
 	Commands["invite"] = function(Args)
 		if Args == "help" then
-			ConsoleMessage("invite: Invites you to Tasability Discord")
+			TASCharacter.ConsoleMessage("invite: Invites you to Tasability Discord")
 		else
-			request({
-				Url = "http://127.0.0.1:6463/rpc?v=1",
-				Method = "POST",
-				Headers = {
-					["Content-Type"] = "application/json",
-					["origin"] = "https://discord.com",
-				},
-				Body = game:GetService("HttpService"):JSONEncode({
-					["args"] = {
-						["code"] = "Shyfsc2cJ9",
-					},
-					["cmd"] = "INVITE_BROWSER",
-					["nonce"] = "."
-				})
-			})
-			return "Sent invite (if your exploit blocked it the invite is https://discord.gg/Shyfsc2cJ9)"
+			local opened, reason = false, "unavailable"
+			if type(_G.__TasabilityOpenDiscordInviteInBrowser) == "function" then
+				opened, reason = _G.__TasabilityOpenDiscordInviteInBrowser(TAS_DISCORD_INVITE_URL)
+			end
+			if opened then
+				return "Sent invite: " .. TAS_DISCORD_INVITE_URL
+			end
+			return "Invite failed: " .. tostring(reason)
 		end
 	end
 end
@@ -6496,83 +7445,83 @@ local StateChanged, CharacterAdded, InputBegan, InputChanged, InputEnded
 local RenderStepped, Stepped, CurrentCamera_Changed
 do
 	StateChanged = function(_,State)
-		table.insert(HumanoidStateQueue,State.Value)
+		table.insert(TASRuntime.HumanoidStateQueue,State.Value)
 	end
 	CharacterAdded = function(NewCharacter)
-		Humanoid = NewCharacter:WaitForChild("Humanoid")
-		Humanoid.StateChanged:Connect(StateChanged)
-		RootPart = NewCharacter:WaitForChild("HumanoidRootPart")
-		DefaultJumpPower = Humanoid.JumpPower
-		DefaultWalkSpeed = Humanoid.WalkSpeed
+		TASCharacter.Humanoid = NewCharacter:WaitForChild("Humanoid")
+		TASCharacter.Humanoid.StateChanged:Connect(StateChanged)
+		TASCharacter.RootPart = NewCharacter:WaitForChild("HumanoidRootPart")
+		TASCharacter.DefaultJumpPower = TASCharacter.Humanoid.JumpPower
+		TASCharacter.DefaultWalkSpeed = TASCharacter.Humanoid.WalkSpeed
 		Reanimate(NewCharacter)
-		Character = NewCharacter
-		Humanoid.Died:Connect(function()
-			Dead = true
+		TASCharacter.Character = NewCharacter
+		TASCharacter.Humanoid.Died:Connect(function()
+			TASRuntime.Dead = true
 		end)
-		Dead = false
+		TASRuntime.Dead = false
 	end
 	InputBegan = function(Input,GameProcessed)
-	if Input.UserInputType == Enum.UserInputType.Keyboard and UserInputService:GetFocusedTextBox() then
+	if Input.UserInputType == Enum.UserInputType.Keyboard and TASServices.UserInputService:GetFocusedTextBox() then
 		return
 	end
 
-	if IgnoreGameProcessed then
+	if TASRuntime.IgnoreGameProcessed then
 		GameProcessed = false
 	end
 	
 	if Input.UserInputType == Enum.UserInputType.MouseButton1 then
-		table.insert(InputBeganQueue,"b1")
+		table.insert(TASRuntime.InputBeganQueue,"b1")
 	elseif Input.UserInputType == Enum.UserInputType.MouseButton2 then
-		table.insert(InputBeganQueue,"b2")
+		table.insert(TASRuntime.InputBeganQueue,"b2")
 	elseif Input.UserInputType == Enum.UserInputType.Keyboard then
 		local InputName = string.split(tostring(Input.KeyCode),".")[3]
-		if not InputBlacklist[InputName] then
-			table.insert(InputBeganQueue,InputName)
+		if not TASConfig.InputBlacklist[InputName] then
+			table.insert(TASRuntime.InputBeganQueue,InputName)
 		end
 	end
 	
-	if Input.KeyCode == Enum.KeyCode.LeftShift and not Reading and not GameProcessed then
-		SetShiftLockEnabled(not ShiftLockEnabled)
+	if Input.KeyCode == Enum.KeyCode.LeftShift and not TASRuntime.Reading and not GameProcessed then
+		TASFunctions.SetShiftLockEnabled(not TASServices.ShiftLockEnabled)
 	end
 	
 	if Input.KeyCode == Recordkeybind.Value and not GameProcessed then
 		-- Freeze/Unfreeze
-		Freeze(not Frozen)
+		Freeze(not TASFreeze.Frozen)
 	elseif Input.KeyCode == Gobackwardskeybind.Value and not GameProcessed then
-		if not Reading then
-			SeekAccumulator = 0
+		if not TASRuntime.Reading then
+			TASFreeze.SeekAccumulator = 0
 			Freeze(true)
-			if SeekDirection == 0 then
-				SeekDirection = -1*SeekDirectionMultiplier -- Backwards
+			if TASFreeze.SeekDirection == 0 then
+				TASFreeze.SeekDirection = -1*TASFreeze.SeekDirectionMultiplier -- Backwards
 			end
 		end
 	elseif Input.KeyCode == Goforwardkeybind.Value and not GameProcessed then
 		-- Seek fowards
-		if not Reading then
-			SeekAccumulator = 0
+		if not TASRuntime.Reading then
+			TASFreeze.SeekAccumulator = 0
 			Freeze(true)
-			if SeekDirection == 0 then
-				SeekDirection = 1*SeekDirectionMultiplier -- Fowards
+			if TASFreeze.SeekDirection == 0 then
+				TASFreeze.SeekDirection = 1*TASFreeze.SeekDirectionMultiplier -- Fowards
 			end
 		end
 	elseif Input.KeyCode == Frameadvancebackwardskeybind.Value and not GameProcessed then
 		-- Go 1 frame backwards
-		SeekAccumulator = 0
+		TASFreeze.SeekAccumulator = 0
 		Freeze(true)
-		if Frozen and SeekDirection == 0 then
-			local NewFreezeFrame = FreezeFrame - 1
-			if NewFreezeFrame > 0 and NewFreezeFrame <= #ReplayTable then
-				FreezeFrame = NewFreezeFrame
+		if TASFreeze.Frozen and TASFreeze.SeekDirection == 0 then
+			local NewFreezeFrame = TASFreeze.FreezeFrame - 1
+			if NewFreezeFrame > 0 and NewFreezeFrame <= #TASRuntime.ReplayTable then
+				TASFreeze.FreezeFrame = NewFreezeFrame
 			end
 		end
 	elseif Input.KeyCode == Frameadvanceforwardkeybind.Value and not GameProcessed then
 		-- Go 1 frame fowards
-		SeekAccumulator = 0
+		TASFreeze.SeekAccumulator = 0
 		Freeze(true)
-		if Frozen and SeekDirection == 0 then
-			local NewFreezeFrame = FreezeFrame + 1
-			if NewFreezeFrame > 0 and NewFreezeFrame <= #ReplayTable then
-				FreezeFrame = NewFreezeFrame
+		if TASFreeze.Frozen and TASFreeze.SeekDirection == 0 then
+			local NewFreezeFrame = TASFreeze.FreezeFrame + 1
+			if NewFreezeFrame > 0 and NewFreezeFrame <= #TASRuntime.ReplayTable then
+				TASFreeze.FreezeFrame = NewFreezeFrame
 			end
 		end
 	elseif Input.KeyCode == Hideuikeybind.Value and not GameProcessed then
@@ -6580,7 +7529,7 @@ do
 		Window:ToggleVisibility()
 	elseif Input.KeyCode == Abortkeybind.Value and not GameProcessed then
 		-- Stop reading
-		StopReading(true)
+		TASFunctions.StopReading(true)
 	elseif Input.KeyCode == Savekeybind.Value and not GameProcessed then
 		-- Save to file
 		SaveToFile()
@@ -6591,17 +7540,17 @@ do
 		ReadButton_MouseButton1Click()
 	elseif Input.KeyCode == Pausekeybind.Value and not GameProcessed then
 		-- Pause/Resume reading
-		if Reading then
-            if not Paused then
-                Paused = true
+		if TASRuntime.Reading then
+            if not TASRuntime.Paused then
+                TASRuntime.Paused = true
                 BeginPlaybackPause()
-                ConsoleMessage("Paused")
+                TASCharacter.ConsoleMessage("Paused")
                 SetColorCodeFrame("Frozen")
             else
                 EndPlaybackPause()
-                Paused = false
-                PlaybackAccumulator = 0
-                ConsoleMessage("Resumed")
+                TASRuntime.Paused = false
+                TASRuntime.PlaybackAccumulator = 0
+                TASCharacter.ConsoleMessage("Resumed")
                 SetColorCodeFrame("Reading")
             end
 		end
@@ -6610,63 +7559,63 @@ end
 	InputChanged = function(Input,GameProcessed)
 		if Input.UserInputType == Enum.UserInputType.MouseWheel then
 			if Input.Position.Z > 0 then
-				table.insert(InputBeganQueue,"u")
+				table.insert(TASRuntime.InputBeganQueue,"u")
 			else
-				table.insert(InputBeganQueue,"d")
+				table.insert(TASRuntime.InputBeganQueue,"d")
 			end
 		end
 	end
 	InputEnded = function(Input,GameProcessed)
-		if Input.UserInputType == Enum.UserInputType.Keyboard and UserInputService:GetFocusedTextBox() then
+		if Input.UserInputType == Enum.UserInputType.Keyboard and TASServices.UserInputService:GetFocusedTextBox() then
 			return
 		end
 		if Input.UserInputType == Enum.UserInputType.MouseButton1 then
-			table.insert(InputEndedQueue,"b1")
+			table.insert(TASRuntime.InputEndedQueue,"b1")
 		elseif Input.UserInputType == Enum.UserInputType.MouseButton2 then
-			table.insert(InputEndedQueue,"b2")
+			table.insert(TASRuntime.InputEndedQueue,"b2")
 		elseif Input.UserInputType == Enum.UserInputType.MouseWheel then
 			if Input.Position.Z > 0 then
-				table.insert(InputEndedQueue,"u")
+				table.insert(TASRuntime.InputEndedQueue,"u")
 			else
-				table.insert(InputEndedQueue,"d")
+				table.insert(TASRuntime.InputEndedQueue,"d")
 			end
 		elseif Input.UserInputType == Enum.UserInputType.Keyboard then
 			local InputName = string.split(tostring(Input.KeyCode),".")[3]
-			if not InputBlacklist[InputName] then
-				table.insert(InputEndedQueue,InputName)
+			if not TASConfig.InputBlacklist[InputName] then
+				table.insert(TASRuntime.InputEndedQueue,InputName)
 			end
 		end
 		
 		if Input.KeyCode == Gobackwardskeybind.Value then
 			-- Stop seeking backwards
-			if SeekDirection == -1*SeekDirectionMultiplier then
-				SeekDirection = 0
+			if TASFreeze.SeekDirection == -1*TASFreeze.SeekDirectionMultiplier then
+				TASFreeze.SeekDirection = 0
 			end
 		elseif Input.KeyCode == Goforwardkeybind.Value then
 			-- Stop seeking fowards
-			if SeekDirection == 1*SeekDirectionMultiplier then
-				SeekDirection = 0
+			if TASFreeze.SeekDirection == 1*TASFreeze.SeekDirectionMultiplier then
+				TASFreeze.SeekDirection = 0
 			end
 		end
 	end
 	RenderStepped = function(deltaTime, ...)
-		for _,Function in pairs(RenderSteppedConnections) do
+		for _,Function in pairs(TASRuntime.RenderSteppedConnections) do
 			Function(deltaTime, ...)
 		end
 	end
 	Stepped = function(...)
-		for _,Function in pairs(SteppedConnections) do
+		for _,Function in pairs(TASRuntime.SteppedConnections) do
 			Function(...)
 		end
 	end
 	ReadButton_MouseButton1Click = function()
-		if ReplayStartTime >= 1 then
-			for i = ReplayStartTime,1,-1 do
-				ConsoleMessage("Reading in "..tostring(i).." seconds")
+		if TASConfig.ReplayStartTime >= 1 then
+			for i = TASConfig.ReplayStartTime,1,-1 do
+				TASCharacter.ConsoleMessage("Reading in "..tostring(i).." seconds")
 				wait(1)
 			end
 		end
-		StartReading()
+		TASFunctions.StartReading()
 	end
 	IdleButton_MouseButton1Click = function()
 		if GetColorCodeFrame() == "Frozen" then
@@ -6674,14 +7623,14 @@ end
 		end
 	end
     CurrentCamera_Changed = function()
-        if Reading then
-            workspace.CurrentCamera.CFrame = CameraCFrame
-        elseif Frozen and not (movecameraonfroze and movecameraonfroze.Value) then
-            local idx = math.clamp(RoundNumber(FreezeFrame, 0), 1, #ReplayTable)
-            local f = ReplayTable[idx]
+        if TASRuntime.Reading then
+            workspace.CurrentCamera.CFrame = TASRuntime.CameraCFrame
+        elseif TASFreeze.Frozen and not (movecameraonfroze and movecameraonfroze.Value) then
+            local idx = math.clamp(TASUtilityFunctions.RoundNumber(TASFreeze.FreezeFrame, 0), 1, #TASRuntime.ReplayTable)
+            local f = TASRuntime.ReplayTable[idx]
             if type(f) == "table" and f[7] then
                 workspace.CurrentCamera.CameraType = Enum.CameraType.Scriptable
-                workspace.CurrentCamera.CFrame = TableToCFrame(f[7])
+                workspace.CurrentCamera.CFrame = TASUtilityFunctions.TableToCFrame(f[7])
             end
         end
     end
@@ -6693,10 +7642,10 @@ end
 			table.remove(InputSplit,1)
 			local ReturnMessage = Command(InputSplit)
 			if ReturnMessage then
-				ConsoleMessage(ReturnMessage)
+				TASCharacter.ConsoleMessage(ReturnMessage)
 			end
 		else
-			ConsoleMessage("Command",InputSplit[1],"was not found")
+			TASCharacter.ConsoleMessage("Command",InputSplit[1],"was not found")
 		end
 		self:Clear()
 	end
@@ -6704,52 +7653,96 @@ end
 
 -- RenderStepped/Stepped connections
 do
-	RenderSteppedConnections.UpdateFreezeFrame = function()
-		RecordedFramesLabel.Text = "Frames: "..RoundNumber(FreezeFrame,0)
-	end
-	RenderSteppedConnections.DrawPathVisuals = function()
-    if pathVisualsEnabled then
+	-- INFO frame label is refreshed by the low-frequency UI sampler below.
+	TASRuntime.RenderSteppedConnections.DrawPathVisuals = function()
+    if TASPaths.pathVisualsEnabled then
         drawPathVisuals()
     end
 end
-	RenderSteppedConnections.SeekDirectionHandler = function(deltaTime)
-		if not Frozen or SeekDirection == 0 then
-			SeekAccumulator = 0
+	TASRuntime.RenderSteppedConnections.SeekDirectionHandler = function(deltaTime)
+		if not TASFreeze.Frozen or TASFreeze.SeekDirection == 0 then
+			TASFreeze.SeekAccumulator = 0
 			return
 		end
 
-		local seekFPS = math.max(1, tonumber(TASRecordingFPS) or 1)
+		local seekFPS = math.max(1, tonumber(TASConfig.TASRecordingFPS) or 1)
 		local interval = 1 / seekFPS
-		SeekAccumulator = SeekAccumulator + math.max(0, tonumber(deltaTime) or 0)
+		TASFreeze.SeekAccumulator = TASFreeze.SeekAccumulator + math.max(0, tonumber(deltaTime) or 0)
 
-		local steps = math.floor((SeekAccumulator + 1e-9) / interval)
+		local steps = math.floor((TASFreeze.SeekAccumulator + 1e-9) / interval)
 		if steps <= 0 then return end
-		SeekAccumulator = SeekAccumulator - steps * interval
-		if SeekAccumulator < 0 then SeekAccumulator = 0 end
+		TASFreeze.SeekAccumulator = TASFreeze.SeekAccumulator - steps * interval
+		if TASFreeze.SeekAccumulator < 0 then TASFreeze.SeekAccumulator = 0 end
 
-		local direction = SeekDirection > 0 and 1 or -1
-		local maxFrame = #ReplayTable
+		local direction = TASFreeze.SeekDirection > 0 and 1 or -1
+		local maxFrame = #TASRuntime.ReplayTable
 		if maxFrame <= 0 then return end
 
-		FreezeFrame = math.clamp(FreezeFrame + direction * steps, 1, maxFrame)
+		TASFreeze.FreezeFrame = math.clamp(TASFreeze.FreezeFrame + direction * steps, 1, maxFrame)
 	end
 
 
     local PressedWriting = {}
-	
-SteppedConnections.UpdateKeyboardOverlay = function()
+
+    local function TASBuildPressedKeysText(keys)
+        local names = {}
+        for keyName, isDown in pairs(keys or {}) do
+            if isDown then names[#names + 1] = tostring(keyName) end
+        end
+        table.sort(names)
+        if #names == 0 then return "|" end
+        return "|" .. table.concat(names, "|") .. "|"
+    end
+
+    -- Low-frequency UI sampler: the game state is updated at normal TAS cadence,
+    -- while these labels are refreshed only 10 times/sec. This keeps the INFO
+    -- panel live without writing TextLabel properties on every render frame.
+    task.spawn(function()
+        local lastFramesText, lastPressedText, lastWritingText
+        while MainFrame and MainFrame.Parent do
+            task.wait(0.1)
+            local frameText
+            if TASRuntime.Writing then
+                frameText = "Frames: " .. tostring(#TASRuntime.RecordingTable)
+            elseif TASRuntime.Reading then
+                frameText = string.format("Frames: %d / %d", TASRuntime.ReplayTableIndex or 0, #TASRuntime.ReplayTable)
+            elseif TASFreeze.Frozen then
+                frameText = string.format("Frames: %d / %d", TASUtilityFunctions.RoundNumber(TASFreeze.FreezeFrame, 0), #TASRuntime.ReplayTable)
+            else
+                frameText = "Frames: " .. tostring(#TASRuntime.ReplayTable)
+            end
+
+            local pressedText = "Pressed keys: " .. TASBuildPressedKeysText(TASRuntime.Pressed)
+            local writingText = "Writing Pressed keys: " .. TASBuildPressedKeysText(PressedWriting)
+
+            if frameText ~= lastFramesText then
+                RecordedFramesLabel.Text = frameText
+                lastFramesText = frameText
+            end
+            if pressedText ~= lastPressedText then
+                PressedKeysLabel.Text = pressedText
+                lastPressedText = pressedText
+            end
+            if writingText ~= lastWritingText then
+                WritingPressedKeysLabel.Text = writingText
+                lastWritingText = writingText
+            end
+        end
+    end)
+
+TASRuntime.SteppedConnections.UpdateKeyboardOverlay = function()
     if getgenv().KeyboardOverlayEnabled and getgenv().KeyboardOverlayKeys then
         local keys = getgenv().KeyboardOverlayKeys
         local theme = KeyboardOverlayThemes[currentTheme]
         
         -- Determine which key table to use
-        local keysToCheck = Writing and PressedWriting or Pressed
+        local keysToCheck = TASRuntime.Writing and PressedWriting or TASRuntime.Pressed
         
         for keyName, keyFrame in pairs(keys) do
             local state = "normal"
             
             if keysToCheck[keyName] then
-                state = Writing and "writing" or "pressed"
+                state = TASRuntime.Writing and "writing" or "pressed"
             end
             
             theme.updateColors(keyFrame, state)
@@ -6757,48 +7750,46 @@ SteppedConnections.UpdateKeyboardOverlay = function()
     end
 end
 
-SteppedConnections.UpdateInputPreview = function()
-	for _,Input in pairs(InputBeganQueue) do
+TASRuntime.SteppedConnections.UpdateInputPreview = function()
+	for _,Input in pairs(TASRuntime.InputBeganQueue) do
 		if Input == "u" or Input == "d" then
 			return
 		end
-		Pressed[Input] = true
+		TASRuntime.Pressed[Input] = true
 	end
-	for _,Input in pairs(InputEndedQueue) do
-		Pressed[Input] = nil
+	for _,Input in pairs(TASRuntime.InputEndedQueue) do
+		TASRuntime.Pressed[Input] = nil
 	end
-	PressedKeysLabel.Text = "Pressed keys: |"
-	for Input,_ in pairs(Pressed) do
-		PressedKeysLabel.Text = PressedKeysLabel.Text..Input.."|"
-	end
-	
-	if Writing then
-		for _,Input in pairs(InputBeganQueue) do
+	-- Pressed-key labels are rendered by the low-frequency INFO sampler.
+
+	if TASRuntime.Writing then
+		for _,Input in pairs(TASRuntime.InputBeganQueue) do
 			if Input == "u" or Input == "d" then
 			else
 				PressedWriting[Input] = true
 			end
 		end
-		for _,Input in pairs(InputEndedQueue) do
+		for _,Input in pairs(TASRuntime.InputEndedQueue) do
 			PressedWriting[Input] = nil
 		end
-		WritingPressedKeysLabel.Text = "Writing Pressed keys: |"
-		for Input,_ in pairs(PressedWriting) do
-			WritingPressedKeysLabel.Text = WritingPressedKeysLabel.Text..Input.."|"
-            end
+		-- Writing pressed-key labels are rendered by the low-frequency INFO sampler.
 		end
 	end
 end
 
 -- Apply saved keybinds/checkbox state after controls are created.
-do
+-- Kept in its own function so these temporary locals do not consume registers
+-- from the large top-level GUI chunk.
+local function ApplySavedControlState()
     local k = type(TasSettings.Keybinds) == "table" and TasSettings.Keybinds or {}
     local map = {HideUI=Hideuikeybind, Record=Recordkeybind, Forward=Goforwardkeybind, Backward=Gobackwardskeybind, FrameForward=Frameadvanceforwardkeybind, FrameBackward=Frameadvancebackwardskeybind, Save=Savekeybind, Read=Readkeybind, Abort=Abortkeybind}
     for name, shim in pairs(map) do
         local enumName = k[name]
         if shim and type(enumName) == "string" then
-            local ok, code = pcall(function() return Enum.KeyCode[enumName] end)
-            if ok and code then shim.Value = code end
+            local ok = pcall(function() shim.Value = Enum.KeyCode[enumName] end)
+            if not ok then
+                -- Ignore unknown/obsolete keybind names from old settings.
+            end
         end
     end
     local c = type(TasSettings.Checkboxes) == "table" and TasSettings.Checkboxes or {}
@@ -6808,6 +7799,8 @@ do
     if MotionBlurToggle and c.MotionBlur ~= nil then MotionBlurToggle.Value = c.MotionBlur end
     if movecameraonfroze and c.MoveCameraFrozen ~= nil then movecameraonfroze.Value = c.MoveCameraFrozen end
 end
+ApplySavedControlState()
+pcall(SaveTasSettings)
 
 -- Lightweight settings watcher. It only writes when the serialized signature changes.
 task.spawn(function()
@@ -6815,7 +7808,7 @@ task.spawn(function()
     while true do
         task.wait(2)
         local parts = {
-            tostring(FPS), tostring(TASRecordingFPS), tostring(currentTheme),
+            tostring(TASConfig.FPS), tostring(TASConfig.TASRecordingFPS), tostring(currentTheme),
             tostring(PlayersPanelVisible), tostring(FilesPanelVisible),
             MainFrame and tostring(MainFrame.Position.X.Scale) or "", MainFrame and tostring(MainFrame.Position.X.Offset) or "",
             MainFrame and tostring(MainFrame.Position.Y.Scale) or "", MainFrame and tostring(MainFrame.Position.Y.Offset) or "",
@@ -6841,28 +7834,30 @@ task.spawn(function()
     end
 end)
 
+
 do -- Connections
-	UserInputService.InputBegan:Connect(InputBegan)
-	UserInputService.InputChanged:Connect(InputChanged)
-	UserInputService.InputEnded:Connect(InputEnded)
-	RunService.RenderStepped:Connect(RenderStepped)
-	RunService.Stepped:Connect(Stepped)
-	Player.CharacterAdded:Connect(CharacterAdded)
+	TASServices.UserInputService.InputBegan:Connect(InputBegan)
+	TASServices.UserInputService.InputChanged:Connect(InputChanged)
+	TASServices.UserInputService.InputEnded:Connect(InputEnded)
+	TASServices.RunService.RenderStepped:Connect(RenderStepped)
+	TASServices.RunService.Stepped:Connect(Stepped)
+	TASServices.Player.CharacterAdded:Connect(CharacterAdded)
 end
 
 do -- Setup
-	GetReplayFile() -- Create folders and files for Replayability+ if needed
-	SetCursor("ArrowFarCursor") -- Add fake cursor - MUST BE BEFORE HIDING REAL CURSOR
-	UserInputService.MouseIconEnabled = false -- Remove real cursor
-	DefaultGravity = workspace.Gravity -- Set DefaultGravity
-	ShiftLockBoundKeys.Value = "" -- Remove shift lock keybinds
-	CharacterAdded(Player.Character) -- Set character
+	-- Replay files are created only explicitly from the Files panel.
+	TASFunctions.SetCursor("ArrowFarCursor") -- Add fake cursor - MUST BE BEFORE HIDING REAL CURSOR
+	TASServices.UserInputService.MouseIconEnabled = false -- Remove real cursor; fake cursor is rendered by TASRuntime.Cursor
+	TASCharacter.DefaultGravity = workspace.Gravity -- Set DefaultGravity
+	TASServices.ShiftLockBoundKeys.Value = "" -- Remove shift lock keybinds
+	CharacterAdded(TASServices.Player.Character) -- Set character
 	SetColorCodeFrame("Idle") -- Set color code
-    if setfpscap then setfpscap(FPS) end
+    if setfpscap then setfpscap(TASConfig.FPS) end
 
-    -- Prepare CO in the background before the first recording. The scan yields
-    -- periodically, and recording will not begin until it is fully ready.
-    pcall(function() CO.QueueInitialization() end)
+    -- Prepare CO only when client-object recording is enabled.
+    if TASConfig.AllowClientObjectManipulation then
+        pcall(function() CO.QueueInitialization() end)
+    end
 end
 
 function findAnimateScript(character)
@@ -6902,18 +7897,19 @@ end
 
 spawn(function() -- Reading Loop
 
-    local frameCache = PlaybackWarmCache
+    local frameCache = TASPause.PlaybackWarmCache
     local lastVelocity = Vector3.new()
     local idleFrameCount = 0
     local idle_threshold = 3
     local playbackAccumulator = 0
     local finalFrameHold = 0
+    local playbackSignal = {}
 
     while true do
-        local deltaTime = RunService.Heartbeat:Wait()
+        local deltaTime = TASServices.RunService.Heartbeat:Wait()
 
-        if Reading then
-            if Paused then
+        if TASRuntime.Reading then
+            if TASRuntime.Paused then
                 playbackAccumulator = 0
                 HoldPlaybackPausedState()
                 continue
@@ -6922,8 +7918,11 @@ spawn(function() -- Reading Loop
             -- The TAS timeline is fixed to the saved recording FPS, not the
             -- client's rendering/heartbeat FPS. At 120 client FPS and 60 TAS
             -- FPS we must keep each TAS frame for two heartbeats.
-            local playbackFPS = math.max(1, tonumber(ActiveReplayFPS or ReplaySourceFPS or TASRecordingFPS) or 1)
-            local playbackInterval = 1 / playbackFPS
+            local playbackInterval = TASRuntime.PlaybackInterval
+            if playbackInterval <= 0 then
+                playbackInterval = 1 / math.max(1, tonumber(TASRuntime.ActiveReplayFPS or TASRuntime.ReplaySourceFPS or TASConfig.TASRecordingFPS) or 1)
+                TASRuntime.PlaybackInterval = playbackInterval
+            end
             playbackAccumulator = playbackAccumulator + math.max(0, tonumber(deltaTime) or 0)
 
             local advanceFrame = false
@@ -6933,70 +7932,70 @@ spawn(function() -- Reading Loop
                 playbackAccumulator = playbackAccumulator - steps * playbackInterval
                 if playbackAccumulator < 0 then playbackAccumulator = 0 end
 
-                local oldIndex = ReplayTableIndex
-                ReplayTableIndex = math.min(ReplayTableIndex + steps, #ReplayTable)
-                advanceFrame = ReplayTableIndex ~= oldIndex
+                local oldIndex = TASRuntime.ReplayTableIndex
+                TASRuntime.ReplayTableIndex = math.min(TASRuntime.ReplayTableIndex + steps, #TASRuntime.ReplayTable)
+                advanceFrame = TASRuntime.ReplayTableIndex ~= oldIndex
             end
 
-            local Frame = ReplayTable[ReplayTableIndex]
+            local Frame = TASRuntime.ReplayTable[TASRuntime.ReplayTableIndex]
 
             if Frame == 0 then
-                Humanoid:ChangeState(15)
-                for _, Descendant in pairs(Character:GetDescendants()) do
+                TASCharacter.Humanoid:ChangeState(15)
+                for _, Descendant in pairs(TASCharacter.Character:GetDescendants()) do
                     if Descendant:IsA("BasePart") then
                         Descendant:Destroy()
                     end
                 end
-                repeat task.wait() until not Dead
-                RunService.Heartbeat:Wait()
-                ReplayTableIndex = ReplayTableIndex + 1
+                repeat task.wait() until not TASRuntime.Dead
+                TASServices.RunService.Heartbeat:Wait()
+                TASRuntime.ReplayTableIndex = TASRuntime.ReplayTableIndex + 1
                 idleFrameCount = 0
                 continue
             elseif Frame == 1 then
-                Humanoid:ChangeState(15)
+                TASCharacter.Humanoid:ChangeState(15)
                 if not AllowChangingPhysics then
                     ApplyConfiguredPhysics(false)
                 end
-                repeat task.wait() until not Dead
-                RunService.Heartbeat:Wait()
-                ReplayTableIndex = ReplayTableIndex + 1
+                repeat task.wait() until not TASRuntime.Dead
+                TASServices.RunService.Heartbeat:Wait()
+                TASRuntime.ReplayTableIndex = TASRuntime.ReplayTableIndex + 1
                 idleFrameCount = 0
                 continue
             end
 
             if not Frame or typeof(Frame) == "string" then
-                StopReading(true)
+                TASFunctions.StopReading(true)
                 continue
             end
 
             -- Animate Script is cached at playback start. Only fall back to a
             -- search if the instance was removed/replaced.
-            local animateScript = CachedAnimateScript
+            local animateScript = TASPause.CachedAnimateScript
             if not animateScript or not animateScript.Parent then
-                animateScript = findAnimateScript(Character)
-                CachedAnimateScript = animateScript
+                animateScript = findAnimateScript(TASCharacter.Character)
+                TASPause.CachedAnimateScript = animateScript
             end
             if animateScript then
                 animateScript.Disabled = true
-                if not ReplayAnimateScript then
-                    ReplayAnimateScript = animateScript
-                    ReplayAnimateScriptDisabled = false
+                if not TASFreeze.ReplayAnimateScript then
+                    TASFreeze.ReplayAnimateScript = animateScript
+                    TASFreeze.ReplayAnimateScriptDisabled = false
                 end
             end
 
-            AnimateDisabled = true
+            TASRuntime.AnimateDisabled = true
             EnforcePlaybackPhysics()
 
-            if not Character:FindFirstChild("HumanoidRootPart") then
-                RunService.Heartbeat:Wait()
+            if not TASCharacter.Character:FindFirstChild("HumanoidRootPart") then
+                TASServices.RunService.Heartbeat:Wait()
                 continue
             end
 
-            local HRP = Character.HumanoidRootPart
-            Humanoid.PlatformStand = true
+            local HRP = TASCharacter.Character.HumanoidRootPart
+            TASCharacter.Humanoid.PlatformStand = true
 
             local inputs = Frame[12] or {{}, {}}
-            local cache = frameCache[ReplayTableIndex]
+            local cache = frameCache[TASRuntime.ReplayTableIndex]
             if not cache then
                 cache = {
                     hrpCFrame = FastTableToCFrame(Frame[1]),
@@ -7013,7 +8012,7 @@ spawn(function() -- Reading Loop
                     inputBegan = inputs[1] or {},
                     inputEnded = inputs[2] or {}
                 }
-                frameCache[ReplayTableIndex] = cache
+                frameCache[TASRuntime.ReplayTableIndex] = cache
             end
 
             local currentVelocity = cache.hrpVel
@@ -7037,8 +8036,8 @@ spawn(function() -- Reading Loop
             -- heartbeat below, keeping the character visually locked to the
             -- current recorded frame.
             if advanceFrame then
-                pose = cache.animPose
-                Humanoid:ChangeState(cache.humanoidState)
+                TASAnimation.pose = cache.animPose
+                TASCharacter.Humanoid:ChangeState(cache.humanoidState)
 
                 if shouldForceIdle then
                     local hasWalkOrRun = false
@@ -7051,70 +8050,71 @@ spawn(function() -- Reading Loop
                     end
 
                     if hasWalkOrRun then
-                        playAnimation("idle", 0.1, Humanoid, true)
+                        playAnimation("idle", 0.1, TASCharacter.Humanoid, true)
                         pcall(setAnimationSpeed, 1.0)
                     else
                         for _, Arguments in pairs(cache.animations) do
-                            playAnimation(Arguments[1], Arguments[2], Humanoid, true)
+                            playAnimation(Arguments[1], Arguments[2], TASCharacter.Humanoid, true)
                         end
                         pcall(setAnimationSpeed, cache.animSpeed)
                     end
                 else
                     for _, Arguments in pairs(cache.animations) do
-                        playAnimation(Arguments[1], Arguments[2], Humanoid, true)
+                        playAnimation(Arguments[1], Arguments[2], TASCharacter.Humanoid, true)
                     end
                     pcall(setAnimationSpeed, cache.animSpeed)
                 end
 
-                SetCameraCFrame(cache.camCFrame)
-                SetZoom(cache.zoom)
+                TASFunctions.SetCameraCFrame(cache.camCFrame)
+                TASFunctions.SetZoom(cache.zoom)
 
-                if cache.shiftLock ~= GetShiftLockEnabled() then
-                    SetShiftLockEnabled(cache.shiftLock)
+                if cache.shiftLock ~= TASFunctions.GetShiftLockEnabled() then
+                    TASFunctions.SetShiftLockEnabled(cache.shiftLock)
                 end
 
-                if PlaybackMouseLocation and not cache.shiftLock and cache.zoom > 0.52 then
+                if TASConfig.PlaybackMouseLocation and not cache.shiftLock and cache.zoom > 0.52 then
                     mousemoveabs(cache.mouseLocation.X, cache.mouseLocation.Y)
                 else
                     local CurrentResolution = workspace.CurrentCamera.ViewportSize
-                    local CurrentGuiInset = GuiService:GetGuiInset()
+                    local CurrentGuiInset = TASServices.GuiService:GetGuiInset()
                     mousemoveabs(
                         (CurrentResolution.X / 2) - CurrentGuiInset.X,
                         (CurrentResolution.Y / 2) - CurrentGuiInset.Y
                     )
                 end
 
-            if PlaybackInputs then
-                local Signal = {}
+            if TASConfig.PlaybackInputs then
+                table.clear(playbackSignal)
+                local Signal = playbackSignal
                 for _, Input in pairs(cache.inputBegan) do
-                    if not InputBlacklist[Input] then
+                    if not TASConfig.InputBlacklist[Input] then
                         local Code = InputCodes[Input]
                         if Code then
                             keypress(Code)
-                            PlaybackPressedKeys[Input] = Code
+                            TASRuntime.PlaybackPressedKeys[Input] = Code
                         elseif Input == "b1" then
                             mouse1press()
-                            PlaybackPressedKeys["b1"] = "b1"
+                            TASRuntime.PlaybackPressedKeys["b1"] = "b1"
                         elseif Input == "b2" then
                             mouse2press()
-                            PlaybackPressedKeys["b2"] = "b2"
+                            TASRuntime.PlaybackPressedKeys["b2"] = "b2"
                         elseif Input == "u" or Input == "d" then
                             table.insert(Signal, Input)
                         end
                     end
                 end
                 for _, Input in pairs(cache.inputEnded) do
-                    if not InputBlacklist[Input] then
+                    if not TASConfig.InputBlacklist[Input] then
                         local Code = InputCodes[Input]
                         if Code then
                             keyrelease(Code)
-                            PlaybackPressedKeys[Input] = nil
+                            TASRuntime.PlaybackPressedKeys[Input] = nil
                         elseif Input == "b1" then
                             mouse1release()
-                            PlaybackPressedKeys["b1"] = nil
+                            TASRuntime.PlaybackPressedKeys["b1"] = nil
                         elseif Input == "b2" then
                             mouse2release()
-                            PlaybackPressedKeys["b2"] = nil
+                            TASRuntime.PlaybackPressedKeys["b2"] = nil
                         end
                     end
                 end
@@ -7132,15 +8132,17 @@ spawn(function() -- Reading Loop
             -- Client objects are interpolated between the current TAS sample
             -- and the next sample. This keeps spinners and other moving KOs
             -- visually smooth without changing the recorded TAS timeline.
-            local coData = Frame[13] or {}
-            local nextFrame = (ReplayTableIndex < #ReplayTable) and ReplayTable[ReplayTableIndex + 1] or nil
-            local nextCO = type(nextFrame) == "table" and nextFrame[13] or nil
-            local coAlpha = math.clamp(playbackAccumulator / playbackInterval, 0, 1)
-            CO.ApplyInterpolatedFrame(coData, nextCO, coAlpha)
+            if TASConfig.AllowClientObjectManipulation then
+                local coData = Frame[13] or {}
+                local nextFrame = (TASRuntime.ReplayTableIndex < #TASRuntime.ReplayTable) and TASRuntime.ReplayTable[TASRuntime.ReplayTableIndex + 1] or nil
+                local nextCO = type(nextFrame) == "table" and nextFrame[13] or nil
+                local coAlpha = math.clamp(playbackAccumulator / playbackInterval, 0, 1)
+                CO.ApplyInterpolatedFrame(coData, nextCO, coAlpha)
+            end
 
             lastVelocity = currentVelocity
 
-            if ReplayTableIndex >= #ReplayTable then
+            if TASRuntime.ReplayTableIndex >= #TASRuntime.ReplayTable then
                 -- We already reached the final frame above. Keep displaying it
                 -- for one complete TAS interval, then finish automatically.
                 if advanceFrame then
@@ -7152,15 +8154,15 @@ spawn(function() -- Reading Loop
                 if finalFrameHold + 1e-9 >= playbackInterval then
                     finalFrameHold = 0
                     playbackAccumulator = 0
-                    StopReading(true)
+                    TASFunctions.StopReading(true)
                     continue
                 end
             else
                 finalFrameHold = 0
             end
 
-            if ReplayTableIndex > 100 then
-                frameCache[ReplayTableIndex - 100] = nil
+            if TASRuntime.ReplayTableIndex > 100 then
+                frameCache[TASRuntime.ReplayTableIndex - 100] = nil
             end
         else
             playbackAccumulator = 0
@@ -7168,14 +8170,14 @@ spawn(function() -- Reading Loop
                 ApplyConfiguredPhysics(false)
             end
             pcall(function()
-                if Character and Character:FindFirstChild("Humanoid") then
-                    Character.Humanoid.PlatformStand = false
+                if TASCharacter.Character and TASCharacter.Character:FindFirstChild("Humanoid") then
+                    TASCharacter.Character.Humanoid.PlatformStand = false
                 end
             end)
             frameCache = {}
             lastVelocity = Vector3.new()
             idleFrameCount = 0
-            PlaybackPressedKeys = {}
+            TASRuntime.PlaybackPressedKeys = {}
             CO.ResetTargets()
         end
 
@@ -7183,17 +8185,17 @@ spawn(function() -- Reading Loop
 end)
 
 -- Clear input queues
-RunService.Heartbeat:Connect(function()
-	if not Writing then
-		InputBeganQueue = {}
-		InputEndedQueue = {}
+TASServices.RunService.Heartbeat:Connect(function()
+	if not TASRuntime.Writing then
+		TASRuntime.InputBeganQueue = {}
+		TASRuntime.InputEndedQueue = {}
 	end
 end)
 
 spawn(function() -- Check if connected
     while true do
         task.wait(2)
-        if not Reading then
+        if not TASRuntime.Reading then
 			local Installed = IsInstalled()
 			if Installed then
 				ConnectedLabel.Text = "AHK folder found"
@@ -7209,92 +8211,109 @@ end)
 spawn(function() -- Writing
     local function buildRepeatFrame(source)
         if type(source) ~= "table" then return nil end
-        local repeatFrame = table.move(source, 1, 13, 1, {})
+        local hasCO = source[13] ~= nil
+        local repeatFrame = table.move(source, 1, hasCO and 13 or 12, 1, {})
         repeatFrame[2] = {}
         repeatFrame[12] = {{}, {}}
+        if not hasCO then repeatFrame[13] = nil end
         return repeatFrame
     end
 
     local function captureFrame()
-        if (not Character or not Character.Parent) or (not Character:FindFirstChild("HumanoidRootPart")) then
-            if type(RecordingTable[#RecordingTable]) == "table" then
-                table.insert(RecordingTable, 0)
+        if (not TASCharacter.Character or not TASCharacter.Character.Parent) or (not TASCharacter.Character:FindFirstChild("HumanoidRootPart")) then
+            if type(TASRuntime.RecordingTable[#TASRuntime.RecordingTable]) == "table" then
+                table.insert(TASRuntime.RecordingTable, 0)
             end
             return nil
-        elseif not Humanoid or Humanoid.Health == 0 then
-            if type(RecordingTable[#RecordingTable]) == "table" then
-                table.insert(RecordingTable, 1)
+        elseif not TASCharacter.Humanoid or TASCharacter.Humanoid.Health == 0 then
+            if type(TASRuntime.RecordingTable[#TASRuntime.RecordingTable]) == "table" then
+                table.insert(TASRuntime.RecordingTable, 1)
             end
             return nil
         end
 
-        local HRP = Character.HumanoidRootPart
-        local Frame = {}
-        Frame[1] = RoundTable(CFrameToTable(HRP.CFrame), RoundDigits)
-        Frame[2] = AnimationQueue
-        Frame[3] = RoundNumber(currentAnimSpeed, RoundDigits)
-        Frame[4] = Humanoid:GetState().Value
-        Frame[5] = RoundTable(Vector3ToTable(HRP.Velocity), RoundDigits)
-        Frame[6] = RoundTable(Vector3ToTable(HRP.RotVelocity), RoundDigits)
-        Frame[7] = RoundTable(CFrameToTable(workspace.CurrentCamera.CFrame), RoundDigits)
-        Frame[8] = RoundNumber(GetZoom(), RoundDigits)
-        Frame[9] = pose
-        Frame[10] = (GetShiftLockEnabled() and 1) or 0
-        Frame[11] = RoundTable(Vector2ToTable(UserInputService:GetMouseLocation()), RoundDigits)
-        Frame[12] = {InputBeganQueue, InputEndedQueue}
-        Frame[13] = CO.RecordFrame()
+        local HRP = TASCharacter.Character.HumanoidRootPart
+        local Frame = table.create(13)
+        Frame[1] = RoundTable(TASUtilityFunctions.CFrameToTable(HRP.CFrame), TASConfig.RoundDigits)
+
+        local animationEvents = TASRuntime.AnimationQueue
+        if TASRuntime.ForceAnimationSync then
+            TASRuntime.ForceAnimationSync = false
+            animationEvents = {}
+            local currentAnimName = TASAnimation.currentAnimName
+            if type(currentAnimName) == "string" and currentAnimName ~= "" then
+                animationEvents[1] = {currentAnimName, 0}
+            end
+        end
+        Frame[2] = animationEvents
+        Frame[3] = TASUtilityFunctions.RoundNumber(TASAnimation.currentAnimSpeed, TASConfig.RoundDigits)
+        Frame[4] = TASCharacter.Humanoid:GetState().Value
+        Frame[5] = RoundTable(TASUtilityFunctions.Vector3ToTable(HRP.Velocity), TASConfig.RoundDigits)
+        Frame[6] = RoundTable(TASUtilityFunctions.Vector3ToTable(HRP.RotVelocity), TASConfig.RoundDigits)
+        Frame[7] = RoundTable(TASUtilityFunctions.CFrameToTable(workspace.CurrentCamera.CFrame), TASConfig.RoundDigits)
+        Frame[8] = TASUtilityFunctions.RoundNumber(TASFunctions.GetZoom(), TASConfig.RoundDigits)
+        Frame[9] = TASAnimation.pose
+        Frame[10] = (TASFunctions.GetShiftLockEnabled() and 1) or 0
+        Frame[11] = RoundTable(Vector2ToTable(TASServices.UserInputService:GetMouseLocation()), TASConfig.RoundDigits)
+        Frame[12] = {TASRuntime.InputBeganQueue, TASRuntime.InputEndedQueue}
+        if TASConfig.AllowClientObjectManipulation then
+            Frame[13] = CO.RecordFrame()
+        end
         return Frame
     end
 
     while true do
-        local deltaTime = RunService.RenderStepped:Wait()
+        local deltaTime = TASServices.RunService.RenderStepped:Wait()
 
-        if Writing then
+        if TASRuntime.Writing then
             -- Cadence follows the TAS recording FPS, not the client FPS cap.
             -- If actual rendering drops below the cap, repeated state frames
             -- preserve the timeline without replaying inputs/animations.
-            local sampleFPS = math.max(1, tonumber(RecordingReplayFPS) or tonumber(TASRecordingFPS) or 1)
-            local sampleInterval = 1 / sampleFPS
-            RecordingAccumulator = RecordingAccumulator + math.max(0, tonumber(deltaTime) or 0)
+            local sampleInterval = TASRuntime.RecordingInterval
+            if sampleInterval <= 0 then
+                sampleInterval = 1 / math.max(1, tonumber(TASRuntime.RecordingReplayFPS) or tonumber(TASConfig.TASRecordingFPS) or 1)
+                TASRuntime.RecordingInterval = sampleInterval
+            end
+            TASRuntime.RecordingAccumulator = TASRuntime.RecordingAccumulator + math.max(0, tonumber(deltaTime) or 0)
 
-            local sampleCount = math.floor((RecordingAccumulator + 1e-9) / sampleInterval)
+            local sampleCount = math.floor((TASRuntime.RecordingAccumulator + 1e-9) / sampleInterval)
             if sampleCount > 0 then
-                RecordingAccumulator = RecordingAccumulator - sampleCount * sampleInterval
-                if RecordingAccumulator < 0 then RecordingAccumulator = 0 end
+                TASRuntime.RecordingAccumulator = TASRuntime.RecordingAccumulator - sampleCount * sampleInterval
+                if TASRuntime.RecordingAccumulator < 0 then TASRuntime.RecordingAccumulator = 0 end
 
                 local Frame = captureFrame()
                 if Frame then
-                    table.insert(RecordingTable, Frame)
+                    TASRuntime.RecordingTable[#TASRuntime.RecordingTable + 1] = Frame
 
                     if sampleCount > 1 then
                         local repeatFrame = buildRepeatFrame(Frame)
                         for _ = 2, sampleCount do
-                            table.insert(RecordingTable, repeatFrame)
+                            TASRuntime.RecordingTable[#TASRuntime.RecordingTable + 1] = repeatFrame
                         end
                     end
 
-                    InputBeganQueue = {}
-                    InputEndedQueue = {}
-                    AnimationQueue = {}
+                    TASRuntime.InputBeganQueue = {}
+                    TASRuntime.InputEndedQueue = {}
+                    TASRuntime.AnimationQueue = {}
                 end
             end
         else
-            RecordingAccumulator = 0
-            if PendingRecordingFlush then
+            TASRuntime.RecordingAccumulator = 0
+            if TASPause.PendingRecordingFlush then
                 local finalFrame = captureFrame()
                 if finalFrame then
-                    table.insert(RecordingTable, finalFrame)
+                    TASRuntime.RecordingTable[#TASRuntime.RecordingTable + 1] = finalFrame
                 end
-                PendingRecordingFlush = false
+                TASPause.PendingRecordingFlush = false
             end
-            InputBeganQueue = {}
-            InputEndedQueue = {}
-            AnimationQueue = {}
+            TASRuntime.InputBeganQueue = {}
+            TASRuntime.InputEndedQueue = {}
+            TASRuntime.AnimationQueue = {}
         end
 
-        RunSpeed = 0
-        ClimbSpeed = 0
-        HumanoidStateQueue = {}
+        TASRuntime.RunSpeed = 0
+        TASRuntime.ClimbSpeed = 0
+        TASRuntime.HumanoidStateQueue = {}
     end
 end)
 
@@ -7305,84 +8324,95 @@ spawn(function() -- Update cursor
 		task.wait(0.1)
 		maxWait = maxWait + 0.1
 		if maxWait > 5 then break end
-	until CursorHolder and Cursor and CursorIcon
+	until CursorHolder and TASRuntime.Cursor and TASRuntime.CursorIcon
 
-	SetCursor("ArrowFarCursor")
-	Cursor.Image = CursorIcon
-	Cursor.Size = CursorSize
-	Cursor.Visible = true
-	Cursor.BackgroundTransparency = 1
-	Cursor.ZIndex = 10000
+	TASFunctions.SetCursor("ArrowFarCursor")
+	TASRuntime.Cursor.Image = TASRuntime.CursorIcon
+	TASRuntime.Cursor.Size = TASRuntime.CursorSize
+	TASRuntime.Cursor.Visible = true
+	TASRuntime.Cursor.BackgroundTransparency = 1
+	TASRuntime.Cursor.ZIndex = 10000
 
 	local lastIcon, lastSize
 	while task.wait() do
 		pcall(function()
 			-- Only update image/size when they actually change
-			if CursorIcon ~= lastIcon then
-				Cursor.Image = CursorIcon
-				lastIcon = CursorIcon
+			if TASRuntime.CursorIcon ~= lastIcon then
+				TASRuntime.Cursor.Image = TASRuntime.CursorIcon
+				lastIcon = TASRuntime.CursorIcon
 			end
-			if CursorSize ~= lastSize then
-				Cursor.Size = CursorSize
-				lastSize = CursorSize
+			if TASRuntime.CursorSize ~= lastSize then
+				TASRuntime.Cursor.Size = TASRuntime.CursorSize
+				lastSize = TASRuntime.CursorSize
 			end
 
 			local ViewportSize = workspace.CurrentCamera.ViewportSize
-			local hw = CursorSize.X.Offset * 0.5
-			local hh = CursorSize.Y.Offset * 0.5
-			if ShiftLockEnabled then
-				Cursor.Position = UDim2.fromOffset(ViewportSize.X * 0.5 - hw, ViewportSize.Y * 0.5 - hh)
+			local hw = TASRuntime.CursorSize.X.Offset * 0.5
+			local hh = TASRuntime.CursorSize.Y.Offset * 0.5
+			if TASServices.ShiftLockEnabled then
+				TASRuntime.Cursor.Position = UDim2.fromOffset(ViewportSize.X * 0.5 - hw, ViewportSize.Y * 0.5 - hh)
 			else
-				local ml = UserInputService:GetMouseLocation()
-				Cursor.Position = UDim2.fromOffset(ml.X - hw, ml.Y - hh)
+				local ml = TASServices.UserInputService:GetMouseLocation()
+				TASRuntime.Cursor.Position = UDim2.fromOffset(ml.X - hw, ml.Y - hh)
 			end
 		end)
 	end
 end)
 
---[[local oldConsoleMessage
-oldConsoleMessage = hookfunction(ConsoleMessage,function(...)
-	if checkcaller() then
-		return oldConsoleMessage(...)
-	end
-end)]]
-
-local LastProcessedFreezeFrame = nil
-local CachedFreezePressedKeys = {}
-local function ProcessFreezeFrame(RoundedFreezeFrame)
-    local Frame = ReplayTable[RoundedFreezeFrame]
+TASPause.PlaybackWarmCache.ProcessFreezeFrame = function(RoundedFreezeFrame)
+    local Frame = TASRuntime.ReplayTable[RoundedFreezeFrame]
     if type(Frame) ~= "table" then return end
 
     local AnimatePose, Animation
+    local PreviousFreezeFrame = TASPause.PlaybackWarmCache._FreezeLastProcessed
+    local FrameChanged = PreviousFreezeFrame ~= nil and PreviousFreezeFrame ~= RoundedFreezeFrame
 
+    -- Resolve the animation event that is active at this exact replay frame.
+    -- Frame[2] is an event queue, not a persistent state field, so empty frames
+    -- must inherit the last animation event from an earlier frame.
     for Index = RoundedFreezeFrame, 1, -1 do
-        if AnimatePose and Animation then break end
-        local F = ReplayTable[Index]
+        local F = TASRuntime.ReplayTable[Index]
         if type(F) == "table" then
-            AnimatePose = F[9]
-            Animation = F[2][#F[2]]
+            if AnimatePose == nil and F[9] ~= nil then
+                AnimatePose = F[9]
+            end
+            local events = F[2]
+            if type(events) == "table" and #events > 0 and not Animation then
+                for eventIndex = #events, 1, -1 do
+                    local ev = events[eventIndex]
+                    if type(ev) == "table" and type(ev[1]) == "string" and ev[1] ~= "" then
+                        Animation = ev
+                        break
+                    end
+                end
+            end
+            if AnimatePose ~= nil and Animation then
+                break
+            end
         end
     end
 
-    local CurrentPressedKeys = CachedFreezePressedKeys
-    if LastProcessedFreezeFrame ~= RoundedFreezeFrame then
+    local CurrentPressedKeys = TASPause.PlaybackWarmCache._FreezePressedKeys or {}
+    if PreviousFreezeFrame ~= RoundedFreezeFrame then
         CurrentPressedKeys = {}
-        for Index = RoundedFreezeFrame - math.max(FrameBacktrackCount, 0), RoundedFreezeFrame do
-            local F = ReplayTable[Index]
-            if F and type(F) == "table" then
-                local BeganInputs, EndedInputs = unpack(F[12] or {{}, {}})
-                for _, Key in pairs(BeganInputs or {}) do
+        local backtrackStart = math.max(1, RoundedFreezeFrame - math.max(TASConfig.FrameBacktrackCount, 0))
+        for Index = backtrackStart, RoundedFreezeFrame do
+            local F = TASRuntime.ReplayTable[Index]
+            if type(F) == "table" then
+                local inputs = F[12] or {{}, {}}
+                local BeganInputs = inputs[1] or {}
+                local EndedInputs = inputs[2] or {}
+                for _, Key in pairs(BeganInputs) do
                     if Key ~= "u" and Key ~= "d" then
                         CurrentPressedKeys[Key] = true
                     end
                 end
-                for _, Key in pairs(EndedInputs or {}) do
+                for _, Key in pairs(EndedInputs) do
                     CurrentPressedKeys[Key] = nil
                 end
             end
         end
-        CachedFreezePressedKeys = CurrentPressedKeys
-        LastProcessedFreezeFrame = RoundedFreezeFrame
+        TASPause.PlaybackWarmCache._FreezePressedKeys = CurrentPressedKeys
     end
 
     WritingPressedKeysLabel.Text = "Writing Pressed keys: |"
@@ -7390,101 +8420,248 @@ local function ProcessFreezeFrame(RoundedFreezeFrame)
         WritingPressedKeysLabel.Text = WritingPressedKeysLabel.Text .. Input .. "|"
     end
 
-    local HumanoidRootPartCFrame     = TableToCFrame(Frame[1])
-    local AnimationSpeed             = Frame[3]
-    local HumanoidState              = Frame[4]
-    local HumanoidRootPartVelocity   = TableToVector3(Frame[5])
-    local HumanoidRootPartRotVelocity = TableToVector3(Frame[6])
-    local FrameCameraCFrame          = TableToCFrame(Frame[7])
-    local Zoom                       = Frame[8]
-    local FrameShiftLock             = (Frame[10] == 1)
-    local MouseLocation              = TableToVector2(Frame[11])
+    -- Snapshot the exact replay state used by unfreeze and by the Player Viewer.
+    local CurrentFrame = TASRuntime.ReplayTable[RoundedFreezeFrame]
+    if type(CurrentFrame) == "table" then
+        if CurrentFrame[1] then TASFreeze.ResumeCFrame = FastTableToCFrame(CurrentFrame[1]) end
+        if CurrentFrame[5] then TASFreeze.ResumeVelocity = FastTableToVector3(CurrentFrame[5]) end
+        if CurrentFrame[6] then TASFreeze.ResumeRotVelocity = FastTableToVector3(CurrentFrame[6]) end
+        TASFreeze.ResumeHumanoidState = CurrentFrame[4]
+        TASFreeze.ResumeAnimPose = CurrentFrame[9] or AnimatePose
+        TASFreeze.ResumeAnimSpeed = tonumber(CurrentFrame[3]) or 1
+    end
 
-    if Animation then
-        if Animation[1] == "walk" then
-            if Humanoid.FloorMaterial ~= Enum.Material.Air and Humanoid:GetState().Value ~= 3 then
-                playAnimation("walk", Animation[2], Humanoid, true)
-            end
-        else
-            playAnimation(Animation[1], Animation[2], Humanoid, true)
+    -- On the first freeze, the live TAS track is the most accurate source of
+    -- animation name/asset/time because playback has already chosen the actual
+    -- animation variant. Keep that exact track identity for subsequent seeks.
+    if not FrameChanged then
+        local liveTrack = TASAnimation.currentAnimTrack
+        if liveTrack and liveTrack.Parent and liveTrack.Animation then
+            TASPause.PlaybackWarmCache._FreezeAnimationName = TASAnimation.currentAnimName
+            TASPause.PlaybackWarmCache._FreezeAnimationId = tostring(liveTrack.Animation.AnimationId or "")
+            TASPause.PlaybackWarmCache._FreezeAnimationTime = tonumber(liveTrack.TimePosition) or 0
+            TASPause.PlaybackWarmCache._FreezeAnimationSpeed = tonumber(TASFreeze.ResumeAnimSpeed or TASAnimation.currentAnimSpeed) or 1
         end
     end
-    pcall(setAnimationSpeed, AnimationSpeed)
-    pose = AnimatePose
 
-    Humanoid:ChangeState(HumanoidState)
-    Character.HumanoidRootPart.Velocity = HumanoidRootPartVelocity
-    Character.HumanoidRootPart.RotVelocity = HumanoidRootPartRotVelocity
-    Character.HumanoidRootPart.CFrame = HumanoidRootPartCFrame
+    local DesiredAnimName = Animation and Animation[1] or nil
+    local CachedAnimName = TASPause.PlaybackWarmCache._FreezeAnimationName
+    local CachedAnimId = TASPause.PlaybackWarmCache._FreezeAnimationId
+    local CachedAnimTime = tonumber(TASPause.PlaybackWarmCache._FreezeAnimationTime) or 0
+    local CachedAnimSpeed = tonumber(TASPause.PlaybackWarmCache._FreezeAnimationSpeed) or tonumber(TASFreeze.ResumeAnimSpeed) or 1
+
+    local HumanoidRootPartCFrame = FastTableToCFrame(Frame[1])
+    local AnimationSpeed = tonumber(Frame[3]) or 1
+    local HumanoidState = Frame[4]
+    local HumanoidRootPartVelocity = FastTableToVector3(Frame[5])
+    local HumanoidRootPartRotVelocity = FastTableToVector3(Frame[6])
+    local FrameCameraCFrame = FastTableToCFrame(Frame[7])
+    local Zoom = Frame[8] or 0
+
+    if DesiredAnimName and DesiredAnimName ~= "" then
+        local CurrentTrack = TASAnimation.currentAnimTrack
+        local CurrentTrackId = CurrentTrack and CurrentTrack.Animation and tostring(CurrentTrack.Animation.AnimationId or "") or ""
+        local SameAnimation = CachedAnimName == DesiredAnimName
+            and (CachedAnimId == "" or CurrentTrackId == "" or CachedAnimId == CurrentTrackId)
+
+        if not SameAnimation or not CurrentTrack or not CurrentTrack.Parent then
+            -- Crossing into a different animation requires a real restart.
+            -- Existing replay files do not store the chosen animation asset id,
+            -- so playAnimation remains backwards-compatible and chooses from the
+            -- same animation set used during normal playback.
+            local animTransition = tonumber(Animation[2]) or 0
+            playAnimation(DesiredAnimName, animTransition, TASCharacter.Humanoid, true, true)
+
+            CurrentTrack = TASAnimation.currentAnimTrack
+            if CurrentTrack and CurrentTrack.Animation then
+                CachedAnimId = tostring(CurrentTrack.Animation.AnimationId or "")
+            end
+            CachedAnimName = DesiredAnimName
+
+            -- We landed on an already-running animation in the middle of its
+            -- recorded span. Start the newly-created track at the phase implied
+            -- by the latest event for this animation, rather than at frame 0.
+            local startFrame = RoundedFreezeFrame
+            for scan = RoundedFreezeFrame, 1, -1 do
+                local sf = TASRuntime.ReplayTable[scan]
+                local events = type(sf) == "table" and sf[2] or nil
+                local found = false
+                if type(events) == "table" then
+                    for evIndex = #events, 1, -1 do
+                        local ev = events[evIndex]
+                        if type(ev) == "table" and ev[1] == DesiredAnimName then
+                            found = true
+                            break
+                        end
+                    end
+                end
+                if found then
+                    startFrame = scan
+                    break
+                end
+            end
+            local replayFPS = math.max(1, tonumber(TASRuntime.ReplaySourceFPS or TASConfig.TASRecordingFPS) or 1)
+            local elapsed = math.max(0, (RoundedFreezeFrame - startFrame) / replayFPS)
+            CachedAnimSpeed = AnimationSpeed
+            CachedAnimTime = elapsed * CachedAnimSpeed
+        elseif FrameChanged then
+            -- Keep the exact animation variant and move its phase by the number
+            -- of TAS frames crossed. Using the mean of the previous and target
+            -- speeds avoids visible phase jumps when animation speed changes.
+            local replayFPS = math.max(1, tonumber(TASRuntime.ReplaySourceFPS or TASConfig.TASRecordingFPS) or 1)
+            local frameDelta = RoundedFreezeFrame - (PreviousFreezeFrame or RoundedFreezeFrame)
+            local previousSpeed = CachedAnimSpeed
+            local targetSpeed = AnimationSpeed
+            local effectiveSpeed = (previousSpeed + targetSpeed) * 0.5
+            CachedAnimTime = CachedAnimTime + (frameDelta / replayFPS) * effectiveSpeed
+            CachedAnimSpeed = targetSpeed
+        end
+
+        if CurrentTrack and CurrentTrack.Parent then
+            pcall(function()
+                local length = tonumber(CurrentTrack.Length) or 0
+                if length > 0 then
+                    local target = CachedAnimTime
+                    if CurrentTrack.Looped then
+                        target = target % length
+                    else
+                        target = math.clamp(target, 0, math.max(0, length - 0.001))
+                    end
+                    CurrentTrack.TimePosition = target
+                else
+                    CurrentTrack.TimePosition = math.max(0, CachedAnimTime)
+                end
+                CurrentTrack:AdjustSpeed(0)
+            end)
+            TASAnimation.currentAnimTrack = CurrentTrack
+            TASAnimation.currentAnimName = DesiredAnimName
+            TASPause.PlaybackWarmCache._FreezeAnimationName = DesiredAnimName
+            TASPause.PlaybackWarmCache._FreezeAnimationId = CachedAnimId
+            TASPause.PlaybackWarmCache._FreezeAnimationTime = CachedAnimTime
+            TASPause.PlaybackWarmCache._FreezeAnimationSpeed = CachedAnimSpeed
+        end
+    elseif TASAnimation.currentAnimTrack and TASAnimation.currentAnimTrack.Parent then
+        -- There is no event on this frame. Keep the live track, but preserve its
+        -- exact name/asset/time instead of blanking the animation state.
+        pcall(function() TASAnimation.currentAnimTrack:AdjustSpeed(0) end)
+        TASPause.PlaybackWarmCache._FreezeAnimationName = TASAnimation.currentAnimName
+        TASPause.PlaybackWarmCache._FreezeAnimationId = TASAnimation.currentAnimTrack.Animation and tostring(TASAnimation.currentAnimTrack.Animation.AnimationId or "") or CachedAnimId
+        TASPause.PlaybackWarmCache._FreezeAnimationTime = tonumber(TASAnimation.currentAnimTrack.TimePosition) or CachedAnimTime
+        TASPause.PlaybackWarmCache._FreezeAnimationSpeed = CachedAnimSpeed
+    end
+
+    if TASFreeze.ResumeAnimPose then TASAnimation.pose = TASFreeze.ResumeAnimPose end
+    if AnimatePose ~= nil then
+        TASAnimation.pose = AnimatePose
+    end
+    if (not TASAnimation.currentAnimName or TASAnimation.currentAnimName == "") and CachedAnimName then
+        TASAnimation.currentAnimName = CachedAnimName
+    end
+
+    -- A frozen frame must freeze the animation track too. The recorded speed is
+    -- retained in ResumeAnimSpeed and restored when unfreezing.
+    pcall(setAnimationSpeed, 0)
+
+    TASCharacter.Humanoid:ChangeState(HumanoidState)
+    TASCharacter.Character.HumanoidRootPart.Velocity = HumanoidRootPartVelocity
+    TASCharacter.Character.HumanoidRootPart.RotVelocity = HumanoidRootPartRotVelocity
+    TASCharacter.Character.HumanoidRootPart.CFrame = HumanoidRootPartCFrame
 
     if not (movecameraonfroze and movecameraonfroze.Value) then
-        FrozenCameraCFrame = FrameCameraCFrame
+        TASFreeze.FrozenCameraCFrame = FrameCameraCFrame
         local cam = workspace.CurrentCamera
         if cam then
             cam.CameraType = Enum.CameraType.Scriptable
-            cam.CFrame = FrozenCameraCFrame
+            cam.CFrame = TASFreeze.FrozenCameraCFrame
         end
         pcall(function()
-            UserInputService.MouseBehavior = Enum.MouseBehavior.LockCurrentPosition
+            TASServices.UserInputService.MouseBehavior = Enum.MouseBehavior.LockCurrentPosition
         end)
-        SetZoom(Zoom)
+        TASFunctions.SetZoom(Zoom)
         -- Do not feed mouse/shift-lock input while frozen. The recorded camera
         -- CFrame is authoritative here.
     end
 
-    if #ReplayTable > 0 then
-        local coState = CO.GetFullStateAtFrame(RoundedFreezeFrame, ReplayTable)
-        CO.ApplyFullState(coState)
-        CO.AnchorAll()
+    if TASConfig.AllowClientObjectManipulation and CO then
+        if #TASRuntime.ReplayTable > 0 and CO.GetFullStateAtFrame and CO.ApplyFullState then
+            local coState = CO.GetFullStateAtFrame(RoundedFreezeFrame, TASRuntime.ReplayTable)
+            CO.ApplyFullState(coState)
+        end
+        if CO.AnchorAll then CO.AnchorAll() end
     end
+
+    -- Mark the frame only after every part of the frame has been applied.
+    -- The old code marked it before animation reconstruction, so the first seek
+    -- was treated as an unchanged frame and never force-resynced the track.
+    TASPause.PlaybackWarmCache._FreezeLastProcessed = RoundedFreezeFrame
 end
 
 spawn(function() -- Handling freezing
     while true do
-        if Frozen then
-            Character.HumanoidRootPart.Anchored = true
-            if FreezeFrame > 0 and FreezeFrame <= #ReplayTable then
-                local RoundedFreezeFrame = RoundNumber(FreezeFrame, 0)
-                if LastProcessedFreezeFrame ~= RoundedFreezeFrame then
-                    ProcessFreezeFrame(RoundedFreezeFrame)
+        if TASFreeze.Frozen then
+            pcall(function()
+                local character = TASCharacter.Character
+                local hrp = character and character:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    hrp.Anchored = true
+                    hrp.AssemblyLinearVelocity = Vector3.zero
+                    hrp.AssemblyAngularVelocity = Vector3.zero
+                end
+                if TASCharacter.Humanoid then
+                    TASCharacter.Humanoid.PlatformStand = true
+                end
+            end)
+            if TASFreeze.FreezeFrame > 0 and TASFreeze.FreezeFrame <= #TASRuntime.ReplayTable then
+                local RoundedFreezeFrame = TASUtilityFunctions.RoundNumber(TASFreeze.FreezeFrame, 0)
+                if TASPause.PlaybackWarmCache._FreezeLastProcessed ~= RoundedFreezeFrame then
+                    TASPause.PlaybackWarmCache.ProcessFreezeFrame(RoundedFreezeFrame)
                 else
                     CO.AnchorAll()
                 end
-                if not (movecameraonfroze and movecameraonfroze.Value) and FrozenCameraCFrame and workspace.CurrentCamera then
+                if not (movecameraonfroze and movecameraonfroze.Value) and TASFreeze.FrozenCameraCFrame and workspace.CurrentCamera then
                     workspace.CurrentCamera.CameraType = Enum.CameraType.Scriptable
-                    workspace.CurrentCamera.CFrame = FrozenCameraCFrame
+                    workspace.CurrentCamera.CFrame = TASFreeze.FrozenCameraCFrame
                 end
             end
         else
-            LastProcessedFreezeFrame = nil
-            CachedFreezePressedKeys = {}
-            pcall(function()
-                Character.HumanoidRootPart.Anchored = false
-            end)
+            TASPause.PlaybackWarmCache._FreezeLastProcessed = nil
+            TASPause.PlaybackWarmCache._FreezePressedKeys = {}
         end
-        RunService.RenderStepped:Wait()
+        TASServices.RunService.RenderStepped:Wait()
     end
 end)
 
-do -- Set checkpoint
-    ConsoleMessage("Loading from file...")
+TASPause.PlaybackWarmCache.InitializeInitialReplay = function()
+    TASCharacter.ConsoleMessage("Loading from file...")
     local fileContent = GetReplayFile()
-    local initialReplay, initialReplayFPS = ReplayDecode(fileContent)
-    ReplayTable = initialReplay
-    ReplaySaveState.Version = ReplaySaveState.Version + 1
-    ReplaySaveState.Encoded = (type(fileContent) == "string" and fileContent ~= "") and fileContent or nil
-    ReplaySaveState.EncodedVersion = ReplaySaveState.Encoded and ReplaySaveState.Version or -1
-    ReplaySourceFPS = math.max(1, tonumber(initialReplayFPS or TASRecordingFPS) or 1)
-    ActiveReplayFPS = math.max(1, tonumber(ReplaySourceFPS or TASRecordingFPS) or 1)
-    if not ReplayTable then
-        ReplayTable = {}
-        ConsoleMessage("There is no replay folder for",PlaceId)
+    if not fileContent then
+        TASRuntime.ReplayTable = {}
+        TASRuntime.ReplaySourceFPS = math.max(1, tonumber(TASConfig.TASRecordingFPS) or 1)
+        TASRuntime.ActiveReplayFPS = TASRuntime.ReplaySourceFPS
+        TASRuntime.ReplaySaveState.Encoded = nil
+        TASRuntime.ReplaySaveState.EncodedVersion = -1
+        TASCharacter.ConsoleMessage("No replay file selected; starting with empty replay cache")
+        return
+    end
+
+    local decodedReplay, decodedFPS = ReplayDecode(fileContent)
+    TASRuntime.ReplayTable = decodedReplay or {}
+    TASRuntime.ReplaySaveState.Version = TASRuntime.ReplaySaveState.Version + 1
+    TASRuntime.ReplaySaveState.Encoded = fileContent ~= "" and fileContent or nil
+    TASRuntime.ReplaySaveState.EncodedVersion = TASRuntime.ReplaySaveState.Encoded and TASRuntime.ReplaySaveState.Version or -1
+    TASRuntime.ReplaySourceFPS = math.max(1, tonumber(decodedFPS or TASConfig.TASRecordingFPS) or 1)
+    TASRuntime.ActiveReplayFPS = math.max(1, tonumber(TASRuntime.ReplaySourceFPS or TASConfig.TASRecordingFPS) or 1)
+
+    if not decodedReplay then
+        TASCharacter.ConsoleMessage("Failed to load replay file")
     else
-        ReplayNeedsReload = false
-        LastLoadedPath = ReplayPath
-        ConsoleMessage("Initial replay loaded and cached")
+        TASPaths.ReplayNeedsReload = false
+        TASPaths.LastLoadedPath = TASPaths.ReplayPath
+        TASCharacter.ConsoleMessage("Initial replay loaded and cached")
     end
 end
 
-ConsoleMessage("Tasability",Version,"loaded in",RoundNumber(tick()-ExecutionTick,2),"seconds")
-ConsoleMessage("Type help to see all commands")
+TASPause.PlaybackWarmCache.InitializeInitialReplay()
+
+TASCharacter.ConsoleMessage("Tasability",TASConfig.Version,"loaded in",TASUtilityFunctions.RoundNumber(tick()-TASPaths.ExecutionTick,2),"seconds")
+TASCharacter.ConsoleMessage("Type help to see all commands")
